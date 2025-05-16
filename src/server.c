@@ -1,4 +1,4 @@
-/* ============================ src/server.c ========================= */
+/* =========================== src/server.c =========================== */
 #include "powerudp.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,10 +7,66 @@
 #include <pthread.h>
 #include <arpa/inet.h>
 
-static int tcp_sock = -1;
+#define MAX_TCP_QUEUE  8
+#define BUF_CMD       128
 
-/* ----------- thread que recebe dados UDP e já devolve ACK (dentro da
-             receive_message() o ACK é enviado automaticamente) ------- */
+/* -------- sockets globais -------- */
+static int tcp_sock = -1;          /* registo clientes               */
+static int mc_sock  = -1;          /* para multicast ConfigMessage   */
+static struct sockaddr_in mc_dst;
+
+/* --------- envia ConfigMessage em multicast ---------- */
+static void multicast_config(uint16_t to_ms, uint8_t max_rtx)
+{
+    char frame[sizeof(PUDPHeader) + sizeof(ConfigMessage)];
+    PUDPHeader *h = (PUDPHeader *)frame;
+    h->seq   = 0;
+    h->flags = PUDP_F_CFG;
+
+    ConfigMessage *c = (ConfigMessage *)(frame + sizeof(PUDPHeader));
+    c->base_timeout_ms = to_ms;
+    c->max_retries     = max_rtx;
+
+    sendto(mc_sock, frame, sizeof frame, 0,
+           (struct sockaddr *)&mc_dst, sizeof mc_dst);
+
+    printf("[SRV] Multicast CFG  timeout=%u  max_retries=%u\n",
+           to_ms, max_rtx);
+}
+
+/* --------- thread TCP por cliente -------------------- */
+static void *client_thr(void *arg)
+{
+    int csock = *(int *)arg; free(arg);
+    char buf[BUF_CMD];
+
+    /* 1) Recebe e valida PSK de registo */
+    RegisterMessage reg;
+    if (recv(csock, &reg, sizeof reg, MSG_WAITALL) != sizeof reg) {
+        close(csock); return NULL;
+    }
+    if (strcmp(reg.psk, "mypsk") != 0) {
+        printf("[SRV] Bad PSK – ligação fechada\n");
+        close(csock); return NULL;
+    }
+    printf("[SRV] PSK OK\n");
+
+    /* 2) Loop de comandos   :setcfg <timeout_ms> <max_rtx> */
+    while (1) {
+        int n = recv(csock, buf, sizeof buf - 1, 0);
+        if (n <= 0) break;
+        buf[n] = '\0';
+
+        uint16_t to_ms; uint8_t max_r;
+        if (sscanf(buf, ":setcfg %hu %hhu", &to_ms, &max_r) == 2) {
+            multicast_config(to_ms, max_r);
+        }
+    }
+    close(csock);
+    return NULL;
+}
+
+/* --------- thread UDP (recebe payload) --------------- */
 static void *udp_loop(void *arg)
 {
     (void)arg;
@@ -18,38 +74,14 @@ static void *udp_loop(void *arg)
 
     while (1) {
         int n = receive_message(msg, sizeof msg - 1);
-        if (n <= 0) continue;         /* 0 = ACK, <0 = nada */
-
+        if (n <= 0) continue;          /* ACK/NACK/CFG ou nada */
         msg[n] = '\0';
         printf("[SRV] UDP '%s'\n", msg);
     }
     return NULL;
 }
 
-/* ---------------- thread por ligação TCP --------------------------- */
-static void *client_thr(void *arg)
-{
-    int csock = *(int *)arg;
-    free(arg);
-
-    RegisterMessage reg;
-    if (recv(csock, &reg, sizeof reg, MSG_WAITALL) != sizeof reg) {
-        close(csock);
-        return NULL;
-    }
-
-    if (strcmp(reg.psk, "mypsk") != 0) {
-        printf("[SRV] Bad PSK\n");
-        close(csock);
-        return NULL;
-    }
-
-    printf("[SRV] PSK OK\n");
-    pause();                          /* mantém a thread viva */
-    return NULL;
-}
-
-/* ----------------------------- main -------------------------------- */
+/* ------------------------------ main ------------------------------ */
 int main(int argc, char **argv)
 {
     if (argc != 2) {
@@ -58,18 +90,24 @@ int main(int argc, char **argv)
     }
     int port = atoi(argv[1]);
 
-    /* 1) Inicia PowerUDP (cria socket UDP e thread de retransmissão) */
+    /* 1) Inicia PowerUDP (socket UDP 6001) */
     if (init_protocol_server() != 0) return 1;
 
-    /* 2) Arranca thread que fica a escutar pacotes UDP */
-    pthread_t udp_th;
-    pthread_create(&udp_th, NULL, udp_loop, NULL);
-    pthread_detach(udp_th);
+    /* 2) Arranca thread UDP listener */
+    pthread_t t_udp; pthread_create(&t_udp, NULL, udp_loop, NULL);
+    pthread_detach(t_udp);
 
-    /* 3) Prepara socket TCP (registo dos clientes) */
+    /* 3) Prepara socket multicast para ConfigMessage */
+    mc_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    int ttl = 1;
+    setsockopt(mc_sock, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof ttl);
+    mc_dst.sin_family = AF_INET;
+    mc_dst.sin_port   = htons(PUDP_CFG_PORT);
+    inet_pton(AF_INET, PUDP_CFG_MC_ADDR, &mc_dst.sin_addr);
+
+    /* 4) TCP listen para registo de clientes */
     tcp_sock = socket(AF_INET, SOCK_STREAM, 0);
-    int yes = 1;
-    setsockopt(tcp_sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+    int yes = 1; setsockopt(tcp_sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
 
     struct sockaddr_in s = {0};
     s.sin_family      = AF_INET;
@@ -77,19 +115,16 @@ int main(int argc, char **argv)
     s.sin_port        = htons(port);
 
     if (bind(tcp_sock, (struct sockaddr *)&s, sizeof s) < 0 ||
-        listen(tcp_sock, 8) < 0) {
-        perror("TCP bind/listen");
-        return 1;
+        listen(tcp_sock, MAX_TCP_QUEUE) < 0) {
+        perror("TCP bind/listen"); return 1;
     }
 
     printf("[SRV] TCP %d  UDP %d ready\n", port, PUDP_DATA_PORT);
 
-    /* 4) Loop principal: aceita cada novo cliente TCP */
+    /* 5) aceita clientes indefinidamente */
     while (1) {
-        struct sockaddr_in c;
-        socklen_t          cl = sizeof c;
-        int                *cs = malloc(sizeof(int));
-
+        struct sockaddr_in c; socklen_t cl = sizeof c;
+        int *cs = malloc(sizeof(int));
         *cs = accept(tcp_sock, (struct sockaddr *)&c, &cl);
         if (*cs < 0) { free(cs); continue; }
 
@@ -97,9 +132,8 @@ int main(int argc, char **argv)
         inet_ntop(AF_INET, &c.sin_addr, ip, sizeof ip);
         printf("[SRV] New TCP client %s:%d\n", ip, ntohs(c.sin_port));
 
-        pthread_t t;
-        pthread_create(&t, NULL, client_thr, cs);
-        pthread_detach(t);
+        pthread_t th;
+        pthread_create(&th, NULL, client_thr, cs);
+        pthread_detach(th);
     }
 }
-/* =================================================================== */

@@ -1,4 +1,4 @@
-/* ============================== src/client.c ============================ */
+/* =========================== src/client.c =========================== */
 #include "powerudp.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,10 +9,16 @@
 
 #define BUFSZ 512
 
-/* ------------------------------------------------------------------ */
-/* Thread que fica a ouvir o socket UDP para:                         */
-/*   • processar automaticamente os ACKs (receive_message)            */
-/*   • imprimir qualquer payload que venha do servidor (eco, etc.)    */
+/* ---------- join ao grupo multicast para ConfigMessage ---------- */
+static void join_cfg_multicast(int udp_fd)
+{
+    struct ip_mreq m;
+    inet_pton(AF_INET, PUDP_CFG_MC_ADDR, &m.imr_multiaddr);
+    m.imr_interface.s_addr = htonl(INADDR_ANY);
+    setsockopt(udp_fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof m);
+}
+
+/* ---------- UDP listener (ACK/NACK/CFG + payload) -------------- */
 static void *udp_listener(void *arg)
 {
     (void)arg;
@@ -20,44 +26,35 @@ static void *udp_listener(void *arg)
 
     while (1) {
         int n = receive_message(buf, sizeof buf - 1);
-        if (n <= 0)                 /* 0 = ACK processado; <0 = nada novo */
-            continue;
+        if (n <= 0) continue;                 /* ACK/NACK/CFG ou nada */
 
         buf[n] = '\0';
-        printf("\n[CLI] RX «%s»\n> ", buf);   /* mostra payload recebido */
+        printf("\n[CLI] RX «%s»\n> ", buf);
         fflush(stdout);
     }
     return NULL;
 }
 
-/* ------------------------------------------------------------------ */
-/* Envia registo TCP com a PSK                                         */
+/* ---------- registo TCP + PSK ---------------------------------- */
 static int tcp_register(const char *srv_ip, int port, const char *psk)
 {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) { perror("socket"); return -1; }
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in d = {0};
+    d.sin_family = AF_INET;
+    d.sin_port   = htons(port);
+    inet_pton(AF_INET, srv_ip, &d.sin_addr);
 
-    struct sockaddr_in dst = {0};
-    dst.sin_family = AF_INET;
-    dst.sin_port   = htons(port);
-    if (inet_pton(AF_INET, srv_ip, &dst.sin_addr) != 1) {
-        fprintf(stderr, "invalid IP\n"); close(sock); return -1;
-    }
-    if (connect(sock, (struct sockaddr *)&dst, sizeof dst) < 0) {
-        perror("connect"); close(sock); return -1;
-    }
+    if (connect(s, (struct sockaddr *)&d, sizeof d) < 0) { perror("connect"); return -1; }
 
-    RegisterMessage reg = {0};
-    strncpy(reg.psk, psk, sizeof reg.psk - 1);
+    RegisterMessage r = {0};
+    strncpy(r.psk, psk, sizeof r.psk - 1);
+    send(s, &r, sizeof r, 0);
 
-    if (send(sock, &reg, sizeof reg, 0) != sizeof reg) {
-        perror("send reg"); close(sock); return -1;
-    }
     printf("[CLI] Registered at %s:%d (PSK OK)\n", srv_ip, port);
-    return sock;                              /* guardamos – futuro uso */
+    return s;
 }
 
-/* ------------------------------------------------------------------ */
+/* ------------------------------ main ------------------------------ */
 int main(int argc, char **argv)
 {
     if (argc != 4) {
@@ -68,22 +65,25 @@ int main(int argc, char **argv)
     int         port = atoi(argv[2]);
     const char *psk  = argv[3];
 
-    /* 1) Iniciar protocolo (bind UDP a porto efémero) */
-    if (init_protocol_client() != 0)            /* ← nova função */
-        return 1;
-    
-    inject_packet_loss(50);
-    
-    /* 2) Lançar thread que consome ACKs / payloads recebidos */
-    pthread_t udp_th;
-    pthread_create(&udp_th, NULL, udp_listener, NULL);
-    pthread_detach(udp_th);
+    /* 1) inicia protocolo (UDP) */
+    if (init_protocol_client() != 0) return 1;
 
-    /* 3) Registo TCP com o servidor */
+    /* 2) join multicast ConfigMessage */
+    join_cfg_multicast(0);             /* udp_sock é global na lib */
+
+    /* 3) thread UDP listener */
+    pthread_t th_udp;
+    pthread_create(&th_udp, NULL, udp_listener, NULL);
+    pthread_detach(th_udp);
+
+    /* 4) injeta perda, se quiseres */
+    // inject_packet_loss(30);
+
+    /* 5) TCP registo */
     int tcp_sock = tcp_register(ip, port, psk);
     if (tcp_sock < 0) return 1;
 
-    /* 4) Interface de linha-de-comando simples                       */
+    /* 6) CLI simples */
     char line[BUFSZ];
     printf("> "); fflush(stdout);
     while (fgets(line, sizeof line, stdin)) {
@@ -91,15 +91,19 @@ int main(int argc, char **argv)
         if (len && line[len - 1] == '\n') line[--len] = '\0';
         if (!len) { printf("> "); continue; }
 
+        if (!strncmp(line, ":setcfg", 7)) {          /* pedido de nova cfg */
+            send(tcp_sock, line, (int)len, 0);
+            printf("[CLI] pedido de nova config enviado\n> ");
+            continue;
+        }
+
         if (send_message(ip, line, (int)len) < 0)
-            perror("[CLI] send_message");
+            perror("send_message");
         else
             printf("[CLI] sent seq\n> ");
-        fflush(stdout);
     }
 
     close_protocol();
     close(tcp_sock);
     return 0;
 }
-/* ======================================================================= */

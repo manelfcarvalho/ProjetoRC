@@ -1,10 +1,12 @@
-/* ======================= src/powerudp.c ===========================
-   Implementação básica do protocolo “PowerUDP”
-   – Sequenciação
-   – ACK automático
+/* ==============================================================
+   PowerUDP  v0.4
+   --------------------------------------------------------------
+   – Sequenciação e ACK
    – Retransmissão com back-off exponencial
-   – Injecção de perda artificial (testing)
-   --------------------------------------------------------------- */
+   – NACK + recuperação de fora-de-ordem
+   – Injecção de perda artificial
+   – Configuração dinâmica (ConfigMessage via multicast)
+   ============================================================ */
 #include "powerudp.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,30 +25,43 @@
 
 typedef struct {
     uint32_t            seq;
-    int                 len;                     /* bytes do frame   */
+    int                 len;
     char                data[sizeof(PUDPHeader)+MAX_PAYLOAD];
-    struct timeval      ts;                      /* último envio     */
-    uint32_t            to_ms;                   /* timeout actual   */
+    struct timeval      ts;
+    uint32_t            to_ms;               /* timeout corrente      */
     int                 retries;
     struct sockaddr_in  dst;
     int                 in_use;
 } Pending;
 
-/* ---------- estado global ---------- */
+/* ----------------------- estado global ---------------------- */
 static int              udp_sock = -1;
 static Pending          pend[MAX_PENDING];
 static pthread_mutex_t  pend_mtx = PTHREAD_MUTEX_INITIALIZER;
-static uint32_t         seq_tx   = 1;
-static int              drop_probability = 0;      /* 0..100 %        */
 
-/* ------------------------------------------------ util */
+static uint32_t         seq_tx   = 1;        /* próximo seq a enviar */
+static uint32_t         expected_seq = 1;    /* próximo seq (Rx)     */
+
+static uint32_t         base_timeout_ms = PUDP_BASE_TO_MS;
+static uint8_t          max_retries     = PUDP_MAX_RETRY;
+static int              drop_probability = 0;   /* sim-drop 0-100 %  */
+
+/* ----------------------- utilidades ------------------------- */
 static uint32_t now_ms(void)
 {
     struct timeval tv; gettimeofday(&tv, NULL);
     return (uint32_t)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
 }
 
-/* ------------------------------------------------ retransmissão */
+static void apply_config(const ConfigMessage *cfg)
+{
+    base_timeout_ms = cfg->base_timeout_ms;
+    max_retries     = cfg->max_retries;
+    printf("[PUDP] NEW CONFIG  timeout=%u ms  max_rtx=%u\n",
+           base_timeout_ms, max_retries);
+}
+
+/* -------------------- retransmissão loop -------------------- */
 static void *retrans_loop(void *arg)
 {
     (void)arg;
@@ -59,31 +74,33 @@ static void *retrans_loop(void *arg)
                 (uint32_t)(pend[i].ts.tv_sec*1000 + pend[i].ts.tv_usec/1000);
 
             if (age >= pend[i].to_ms) {
-                if (pend[i].retries >= PUDP_MAX_RETRY) {
+                if (pend[i].retries >= max_retries) {
                     fprintf(stderr,
-                        "[PUDP] seq %u DROPPED after %d tries\n",
-                        pend[i].seq, pend[i].retries);
+                            "[PUDP] seq %u DROPPED after %d tries\n",
+                            pend[i].seq, pend[i].retries);
                     pend[i].in_use = 0;
                     continue;
                 }
                 sendto(udp_sock, pend[i].data, pend[i].len, 0,
-                       (struct sockaddr*)&pend[i].dst, sizeof pend[i].dst);
+                       (struct sockaddr*)&pend[i].dst,
+                       sizeof pend[i].dst);
+
                 gettimeofday(&pend[i].ts, NULL);
                 pend[i].retries++;
-                pend[i].to_ms *= 2;       /* back-off ×2               */
+                pend[i].to_ms *= 2;                    /* back-off ×2 */
 
                 fprintf(stderr,
-                    "[PUDP] retrans seq=%u (try %d, to %ums)\n",
-                    pend[i].seq, pend[i].retries, pend[i].to_ms);
+                        "[PUDP] retrans seq=%u (try %d, to %ums)\n",
+                        pend[i].seq, pend[i].retries, pend[i].to_ms);
             }
         }
         pthread_mutex_unlock(&pend_mtx);
-        usleep(100 * 1000);               /* 100 ms */
+        usleep(100 * 1000);                            /* 100 ms */
     }
     return NULL;
 }
 
-/* ------------------------------------------------ pendente helpers */
+/* -------------------- tabela pendentes ---------------------- */
 static void add_pending(uint32_t seq, const char *frame, int len,
                         const struct sockaddr_in *dst)
 {
@@ -94,7 +111,7 @@ static void add_pending(uint32_t seq, const char *frame, int len,
         pend[i].dst     = *dst;
         gettimeofday(&pend[i].ts, NULL);
         pend[i].retries = 0;
-        pend[i].to_ms   = PUDP_BASE_TO_MS;   /* 500 ms inicial */
+        pend[i].to_ms   = base_timeout_ms;
         pend[i].in_use  = 1;
         return;
     }
@@ -104,17 +121,29 @@ static void ack_pending(uint32_t seq)
 {
     for (int i = 0; i < MAX_PENDING; ++i)
         if (pend[i].in_use && pend[i].seq == seq) {
-            pend[i].in_use = 0;
-            return;
+            pend[i].in_use = 0; return;
         }
 }
 
-/* ------------------------------------------------ init comuns */
+static int resend_now(uint32_t seq)
+{
+    for (int i = 0; i < MAX_PENDING; ++i)
+        if (pend[i].in_use && pend[i].seq == seq) {
+            sendto(udp_sock, pend[i].data, pend[i].len, 0,
+                   (struct sockaddr*)&pend[i].dst,
+                   sizeof pend[i].dst);
+            gettimeofday(&pend[i].ts, NULL);
+            fprintf(stderr,
+                    "[PUDP] NACK → instant retrans seq=%u\n", seq);
+            return 0;
+        }
+    return -1;
+}
+
+/* -------------------- socket init / close ------------------- */
 static int common_udp_init(uint16_t bind_port)
 {
-    /* RNG para sim-drop */
-    static int rng_init = 0;
-    if (!rng_init) { srand((unsigned)time(NULL)); rng_init = 1; }
+    static int rng = 0; if (!rng){ srand((unsigned)time(NULL)); rng = 1; }
 
     udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (udp_sock < 0) { perror("udp socket"); return -1; }
@@ -143,7 +172,7 @@ void close_protocol(void)
     if (udp_sock >= 0) close(udp_sock);
 }
 
-/* ------------------------------------------------ injecção de perda */
+/* -------------------- perda artificial ---------------------- */
 int inject_packet_loss(int pct)
 {
     if (pct < 0 || pct > 100) return -1;
@@ -151,17 +180,12 @@ int inject_packet_loss(int pct)
     return 0;
 }
 
-/* ------------------------------------------------ enviar */
+/* -------------------- envio fiável -------------------------- */
 int send_message(const char *dest_ip, const void *buf, int len)
 {
     if (udp_sock < 0 || len > MAX_PAYLOAD) { errno = EINVAL; return -1; }
 
-    /* sim-drop antes de formar frame */
-    if (drop_probability && (rand() % 100) < drop_probability) {
-        fprintf(stderr, "[PUDP]  **SIM DROP %d%%**\n", drop_probability);
-        return len;                                     /* finge sucesso */
-    }
-
+    /* frame pronto */
     char frame[sizeof(PUDPHeader) + MAX_PAYLOAD];
     PUDPHeader *h = (PUDPHeader*)frame;
     h->seq   = htonl(seq_tx++);
@@ -176,17 +200,25 @@ int send_message(const char *dest_ip, const void *buf, int len)
         errno = EINVAL; return -1;
     }
 
+    /* Regista pendente antes de possível drop simulado */
+    pthread_mutex_lock(&pend_mtx);
+    add_pending(ntohl(h->seq), frame, flen, &dst);
+    pthread_mutex_unlock(&pend_mtx);
+
+    /* Perda artificial */
+    if (drop_probability && (rand() % 100) < drop_probability) {
+        fprintf(stderr, "[PUDP]  **SIM DROP %d%%**\n", drop_probability);
+        return len;                 /* temporizador cuidará do retry */
+    }
+
     if (sendto(udp_sock, frame, flen, 0,
                (struct sockaddr*)&dst, sizeof dst) != flen)
         return -1;
 
-    pthread_mutex_lock(&pend_mtx);
-    add_pending(ntohl(h->seq), frame, flen, &dst);
-    pthread_mutex_unlock(&pend_mtx);
     return len;
 }
 
-/* ------------------------------------------------ receber */
+/* -------------------- recepção + NACK ----------------------- */
 int receive_message(void *buf, int buflen)
 {
     if (udp_sock < 0) { errno = EBADF; return -1; }
@@ -201,7 +233,7 @@ int receive_message(void *buf, int buflen)
     PUDPHeader *h = (PUDPHeader*)frame;
     h->seq = ntohl(h->seq);
 
-    /* ACK recebido */
+    /* ---------- ACK */
     if (h->flags & PUDP_F_ACK) {
         pthread_mutex_lock(&pend_mtx);
         ack_pending(h->seq);
@@ -209,7 +241,32 @@ int receive_message(void *buf, int buflen)
         return 0;
     }
 
-    /* payload normal → envia ACK */
+    /* ---------- NACK */
+    if (h->flags & PUDP_F_NAK) {
+        resend_now(h->seq);
+        return 0;
+    }
+
+    /* ---------- ConfigMessage */
+    if (h->flags & PUDP_F_CFG) {
+        if ((size_t)n >= sizeof(PUDPHeader) + sizeof(ConfigMessage)) {
+            apply_config((ConfigMessage*)
+                         (frame + sizeof(PUDPHeader)));
+        }
+        return 0;
+    }
+
+    /* ---------- Payload normal */
+    if (h->seq != expected_seq) {
+        /* fora-de-ordem: pede NACK */
+        PUDPHeader nack = { htonl(expected_seq), PUDP_F_NAK,{0,0,0} };
+        sendto(udp_sock, &nack, sizeof nack, 0,
+               (struct sockaddr*)&src, sizeof src);
+        return 0;                   /* descarta o fora-de-ordem */
+    }
+    expected_seq++;                 /* ordem correcta — avança */
+
+    /* envia ACK */
     PUDPHeader ack = { htonl(h->seq), PUDP_F_ACK,{0,0,0} };
     sendto(udp_sock, &ack, sizeof ack, 0,
            (struct sockaddr*)&src, sizeof src);
@@ -219,4 +276,3 @@ int receive_message(void *buf, int buflen)
     memcpy(buf, frame + sizeof(PUDPHeader), dlen);
     return dlen;
 }
-/* ================================================================== */
