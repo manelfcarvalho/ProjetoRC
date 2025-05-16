@@ -1,48 +1,173 @@
-/* ================== PowerUDP – implementação básica ================= */
+/* ======================= src/powerudp.c ===========================
+   Implementação básica do protocolo “PowerUDP”
+   – Sequenciação
+   – ACK automático
+   – Retransmissão com back-off exponencial
+   – Injecção de perda artificial (testing)
+   --------------------------------------------------------------- */
 #include "powerudp.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <pthread.h>
+#include <sys/time.h>
 #include <sys/socket.h>
+#include <time.h>
 
-static int udp_sock = -1;
+#define MAX_PENDING 32
+#define MAX_PAYLOAD 512
 
-/* ------------------------------------------------ init / close */
-int init_protocol(const char *server_ip, int tcp_port, const char *psk)
+typedef struct {
+    uint32_t            seq;
+    int                 len;                     /* bytes do frame   */
+    char                data[sizeof(PUDPHeader)+MAX_PAYLOAD];
+    struct timeval      ts;                      /* último envio     */
+    uint32_t            to_ms;                   /* timeout actual   */
+    int                 retries;
+    struct sockaddr_in  dst;
+    int                 in_use;
+} Pending;
+
+/* ---------- estado global ---------- */
+static int              udp_sock = -1;
+static Pending          pend[MAX_PENDING];
+static pthread_mutex_t  pend_mtx = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t         seq_tx   = 1;
+static int              drop_probability = 0;      /* 0..100 %        */
+
+/* ------------------------------------------------ util */
+static uint32_t now_ms(void)
 {
-    (void)server_ip; (void)tcp_port; (void)psk; /* ainda não usados aqui */
+    struct timeval tv; gettimeofday(&tv, NULL);
+    return (uint32_t)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
+}
+
+/* ------------------------------------------------ retransmissão */
+static void *retrans_loop(void *arg)
+{
+    (void)arg;
+    while (1) {
+        pthread_mutex_lock(&pend_mtx);
+        uint32_t now = now_ms();
+
+        for (int i = 0; i < MAX_PENDING; ++i) if (pend[i].in_use) {
+            uint32_t age = now -
+                (uint32_t)(pend[i].ts.tv_sec*1000 + pend[i].ts.tv_usec/1000);
+
+            if (age >= pend[i].to_ms) {
+                if (pend[i].retries >= PUDP_MAX_RETRY) {
+                    fprintf(stderr,
+                        "[PUDP] seq %u DROPPED after %d tries\n",
+                        pend[i].seq, pend[i].retries);
+                    pend[i].in_use = 0;
+                    continue;
+                }
+                sendto(udp_sock, pend[i].data, pend[i].len, 0,
+                       (struct sockaddr*)&pend[i].dst, sizeof pend[i].dst);
+                gettimeofday(&pend[i].ts, NULL);
+                pend[i].retries++;
+                pend[i].to_ms *= 2;       /* back-off ×2               */
+
+                fprintf(stderr,
+                    "[PUDP] retrans seq=%u (try %d, to %ums)\n",
+                    pend[i].seq, pend[i].retries, pend[i].to_ms);
+            }
+        }
+        pthread_mutex_unlock(&pend_mtx);
+        usleep(100 * 1000);               /* 100 ms */
+    }
+    return NULL;
+}
+
+/* ------------------------------------------------ pendente helpers */
+static void add_pending(uint32_t seq, const char *frame, int len,
+                        const struct sockaddr_in *dst)
+{
+    for (int i = 0; i < MAX_PENDING; ++i) if (!pend[i].in_use) {
+        pend[i].seq     = seq;
+        pend[i].len     = len;
+        memcpy(pend[i].data, frame, len);
+        pend[i].dst     = *dst;
+        gettimeofday(&pend[i].ts, NULL);
+        pend[i].retries = 0;
+        pend[i].to_ms   = PUDP_BASE_TO_MS;   /* 500 ms inicial */
+        pend[i].in_use  = 1;
+        return;
+    }
+}
+
+static void ack_pending(uint32_t seq)
+{
+    for (int i = 0; i < MAX_PENDING; ++i)
+        if (pend[i].in_use && pend[i].seq == seq) {
+            pend[i].in_use = 0;
+            return;
+        }
+}
+
+/* ------------------------------------------------ init comuns */
+static int common_udp_init(uint16_t bind_port)
+{
+    /* RNG para sim-drop */
+    static int rng_init = 0;
+    if (!rng_init) { srand((unsigned)time(NULL)); rng_init = 1; }
 
     udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (udp_sock < 0) { perror("UDP socket"); return -1; }
+    if (udp_sock < 0) { perror("udp socket"); return -1; }
 
-    /* bind a porto efémero – deixa OS escolher */
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = 0;
-    if (bind(udp_sock, (struct sockaddr*)&addr, sizeof addr) < 0) {
-        perror("UDP bind"); close(udp_sock); return -1;
+    struct sockaddr_in a = {0};
+    a.sin_family      = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    a.sin_port        = htons(bind_port);
+    if (bind(udp_sock, (struct sockaddr*)&a, sizeof a) < 0) {
+        perror("udp bind"); return -1;
     }
 
-    /* non-blocking para poder usar recv poll */
-    int flags = fcntl(udp_sock, F_GETFL, 0);
-    fcntl(udp_sock, F_SETFL, flags | O_NONBLOCK);
+    int fl = fcntl(udp_sock, F_GETFL, 0);
+    fcntl(udp_sock, F_SETFL, fl | O_NONBLOCK);
 
+    pthread_t th; pthread_create(&th, NULL, retrans_loop, NULL);
+    pthread_detach(th);
     return 0;
 }
+
+int init_protocol_client(void) { return common_udp_init(0); }
+int init_protocol_server(void) { return common_udp_init(PUDP_DATA_PORT); }
 
 void close_protocol(void)
 {
     if (udp_sock >= 0) close(udp_sock);
 }
 
-/* ------------------------------------------------ envio simples */
+/* ------------------------------------------------ injecção de perda */
+int inject_packet_loss(int pct)
+{
+    if (pct < 0 || pct > 100) return -1;
+    drop_probability = pct;
+    return 0;
+}
+
+/* ------------------------------------------------ enviar */
 int send_message(const char *dest_ip, const void *buf, int len)
 {
-    if (udp_sock < 0) { errno = EBADF; return -1; }
+    if (udp_sock < 0 || len > MAX_PAYLOAD) { errno = EINVAL; return -1; }
+
+    /* sim-drop antes de formar frame */
+    if (drop_probability && (rand() % 100) < drop_probability) {
+        fprintf(stderr, "[PUDP]  **SIM DROP %d%%**\n", drop_probability);
+        return len;                                     /* finge sucesso */
+    }
+
+    char frame[sizeof(PUDPHeader) + MAX_PAYLOAD];
+    PUDPHeader *h = (PUDPHeader*)frame;
+    h->seq   = htonl(seq_tx++);
+    h->flags = 0;
+    memcpy(frame + sizeof(PUDPHeader), buf, len);
+    int flen = sizeof(PUDPHeader) + len;
 
     struct sockaddr_in dst = {0};
     dst.sin_family = AF_INET;
@@ -50,15 +175,48 @@ int send_message(const char *dest_ip, const void *buf, int len)
     if (inet_pton(AF_INET, dest_ip, &dst.sin_addr) != 1) {
         errno = EINVAL; return -1;
     }
-    return sendto(udp_sock, buf, len, 0,
-                  (struct sockaddr*)&dst, sizeof dst);
+
+    if (sendto(udp_sock, frame, flen, 0,
+               (struct sockaddr*)&dst, sizeof dst) != flen)
+        return -1;
+
+    pthread_mutex_lock(&pend_mtx);
+    add_pending(ntohl(h->seq), frame, flen, &dst);
+    pthread_mutex_unlock(&pend_mtx);
+    return len;
 }
 
-/* ------------------------------------------------ recepção simples */
+/* ------------------------------------------------ receber */
 int receive_message(void *buf, int buflen)
 {
     if (udp_sock < 0) { errno = EBADF; return -1; }
-    return recv(udp_sock, buf, buflen, 0);
-}
 
-/* -------- TODO: retransmissão, back-off, ACK/NACK, tabela de envios */
+    char frame[sizeof(PUDPHeader) + MAX_PAYLOAD];
+    struct sockaddr_in src; socklen_t sl = sizeof src;
+
+    int n = recvfrom(udp_sock, frame, sizeof frame, 0,
+                     (struct sockaddr*)&src, &sl);
+    if (n <= 0) return n;
+
+    PUDPHeader *h = (PUDPHeader*)frame;
+    h->seq = ntohl(h->seq);
+
+    /* ACK recebido */
+    if (h->flags & PUDP_F_ACK) {
+        pthread_mutex_lock(&pend_mtx);
+        ack_pending(h->seq);
+        pthread_mutex_unlock(&pend_mtx);
+        return 0;
+    }
+
+    /* payload normal → envia ACK */
+    PUDPHeader ack = { htonl(h->seq), PUDP_F_ACK,{0,0,0} };
+    sendto(udp_sock, &ack, sizeof ack, 0,
+           (struct sockaddr*)&src, sizeof src);
+
+    int dlen = n - (int)sizeof(PUDPHeader);
+    if (dlen > buflen) dlen = buflen;
+    memcpy(buf, frame + sizeof(PUDPHeader), dlen);
+    return dlen;
+}
+/* ================================================================== */

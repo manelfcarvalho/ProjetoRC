@@ -1,10 +1,4 @@
 # ============================ Makefile =============================
-# Usage:
-#   make            – build biblioteca + server + client
-#   make server     – só server
-#   make client     – só client
-#   make clean      – remove obj + bin
-# ------------------------------------------------------------------
 CC      = gcc
 CFLAGS  = -Wall -Wextra -pedantic -std=c11 -pthread
 LDFLAGS = -pthread
@@ -30,7 +24,7 @@ $(OBJ_DIR) $(BIN_DIR):
 
 all: $(OBJ_DIR) $(BIN_DIR) $(LIB_A) $(SRV_BIN) $(CLI_BIN)
 
-$(LIB_A): $(LIB_OBJ)
+$(LIB_A): $(LIB_OBJ) | $(BIN_DIR)
 	ar rcs $@ $^
 
 $(SRV_BIN): $(SRV_OBJ) $(LIB_A)
@@ -47,4 +41,5 @@ client: $(CLI_BIN)
 
 clean:
 	rm -rf $(OBJ_DIR) $(BIN_DIR)
-# ==================================================================
+# ===================================================================
+
