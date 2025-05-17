@@ -7,6 +7,10 @@
    – Injecção de perda artificial
    – Configuração dinâmica (ConfigMessage via multicast)
    ============================================================ */
+
+#define _POSIX_C_SOURCE 200809L
+#include <unistd.h>
+#include <time.h>
 #include "powerudp.h"
 #include <stdio.h>
 #include <stdlib.h>

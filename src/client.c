@@ -77,7 +77,7 @@ int main(int argc, char **argv)
     pthread_detach(th_udp);
 
     /* 4) injeta perda, se quiseres */
-    // inject_packet_loss(30);
+    //inject_packet_loss(30);
 
     /* 5) TCP registo */
     int tcp_sock = tcp_register(ip, port, psk);
