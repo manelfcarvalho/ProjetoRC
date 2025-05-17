@@ -1,4 +1,7 @@
 /* ============================ src/client.c =========================== */
+#define _DEFAULT_SOURCE
+#define _GNU_SOURCE
+
 #include "powerudp.h"
 #include <stdio.h>
 #include <stdlib.h>
