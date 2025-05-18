@@ -74,7 +74,7 @@ int main(int argc, char **argv)
 
     /* 1) Socket multicast sobre o DATA_PORT */
     mc_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    int ttl = 1;
+    int ttl = 5;  /* Aumentado para permitir mais hops */
     setsockopt(mc_sock, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof ttl);
     mc_dst.sin_family = AF_INET;
     mc_dst.sin_port   = htons(PUDP_DATA_PORT);            /* 6001 */
