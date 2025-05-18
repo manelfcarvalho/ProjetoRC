@@ -24,7 +24,7 @@ static void multicast_config(uint16_t to_ms, uint8_t max_rtx)
     h->flags = PUDP_F_CFG;
 
     ConfigMessage *c = (ConfigMessage *)(frame + sizeof(PUDPHeader));
-    c->base_timeout_ms = to_ms;
+    c->base_timeout_ms = (uint32_t)to_ms;
     c->max_retries     = max_rtx;
 
     sendto(mc_sock, frame, sizeof frame, 0,
