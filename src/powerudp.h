@@ -16,6 +16,10 @@
 #define PUDP_F_NAK 0x2
 #define PUDP_F_CFG 0x4
 
+/* expõe o socket UDP interno para join_multicast */
+extern int udp_sock;
+
+
 /* header */
 typedef struct {
     uint32_t seq;

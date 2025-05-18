@@ -32,7 +32,8 @@ static Pending          pend[MAX_PENDING];
 static pthread_mutex_t  pend_mtx          = PTHREAD_MUTEX_INITIALIZER;
 
 /* UDP socket */
-static int              udp_sock          = -1;
+int udp_sock = -1;
+
 
 /* sequencing & timeouts */
 static uint32_t         seq_tx            = 1;

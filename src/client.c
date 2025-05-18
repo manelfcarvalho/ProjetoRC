@@ -12,7 +12,7 @@
 #include <netinet/in.h>
 #include <pthread.h>
 
-/* extern UDP socket defined in powerudp.c (remove static qualifier there) */
+/* traz o socket UDP da biblioteca */
 extern int udp_sock;
 
 #define BUFSZ 512
@@ -22,7 +22,11 @@ static void join_cfg_multicast(void) {
     struct ip_mreq m;
     inet_pton(AF_INET, PUDP_CFG_MC_ADDR, &m.imr_multiaddr);
     m.imr_interface.s_addr = htonl(INADDR_ANY);
-    setsockopt(udp_sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof m);
+    if (setsockopt(udp_sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                   &m, sizeof m) < 0) {
+        perror("multicast join");
+        exit(1);
+    }
 }
 
 /* listener de pacotes UDP (ACK/NACK/CFG + payload de outros peers) */
@@ -31,7 +35,7 @@ static void *udp_listener(void *arg) {
     char buf[BUFSZ];
     while (1) {
         int n = receive_message(buf, sizeof buf - 1);
-        if (n <= 0) continue;  /* ACK/NACK/CFG ou nada */
+        if (n <= 0) continue;
         buf[n] = '\0';
         printf("\n[CLI] RX «%s»\n> ", buf);
         fflush(stdout);
@@ -68,7 +72,7 @@ int main(int argc, char **argv) {
     /* 1) inicia PowerUDP (socket UDP 6001) */
     if (init_protocol_server() != 0) return 1;
 
-    /* 2) regista no grupo multicast para configuração dinâmica */
+    /* 2) faz join no grupo multicast */
     join_cfg_multicast();
 
     /* 3) thread UDP listener */
@@ -88,29 +92,20 @@ int main(int argc, char **argv) {
         if (len && line[len-1]=='\n') line[--len]='\0';
         if (!len) { printf("> "); continue; }
 
-        /* comandos de configuração via TCP */
+        /* comando :setcfg via TCP */
         if (!strncmp(line, ":setcfg", 7)) {
             send(tcp, line, (int)len, 0);
             printf("[CLI] pedido de nova config enviado\n> ");
             continue;
         }
-        /* P2P UDP unicast: sintaxe "<dest_ip> <mensagem>" */
+        /* P2P UDP unicast: "<dest_ip> <msg>" ou sem espaço → servidor */
         char *space = strchr(line, ' ');
-        if (space) {
-            *space = '\0';
-            const char *dest_ip = line;
-            const char *msg     = space + 1;
-            if (send_message(dest_ip, msg, (int)strlen(msg)) < 0)
-                perror("send_message");
-            else
-                printf("[CLI] sent seq to %s\n> ", dest_ip);
-            continue;
-        }
-        /* sem espaço: envia ao servidor */
-        if (send_message(ip, line, (int)strlen(line)) < 0)
+        const char *dest = space ? line : ip;
+        const char *msg  = space ? space+1 : line;
+        if (send_message(dest, msg, (int)strlen(msg)) < 0)
             perror("send_message");
         else
-            printf("[CLI] sent seq to server %s\n> ", ip);
+            printf("[CLI] sent seq to %s\n> ", dest);
     }
 
     close_protocol();
