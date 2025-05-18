@@ -8,13 +8,13 @@
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
-#include <sys/socket.h>    /* IP_ADD_MEMBERSHIP */
-#include <netinet/in.h>    /* struct ip_mreq */
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <pthread.h>
 
 #define BUFSZ 512
 
-/* faz join no grupo 239.0.0.100:6000 para ConfigMessage */
+/* faz join no grupo multicast para ConfigMessage */
 static void join_cfg_multicast(int udp_fd) {
     struct ip_mreq m;
     inet_pton(AF_INET, PUDP_CFG_MC_ADDR, &m.imr_multiaddr);
@@ -22,12 +22,13 @@ static void join_cfg_multicast(int udp_fd) {
     setsockopt(udp_fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof m);
 }
 
+/* listener de pacotes UDP (ACK/NACK/CFG + payload de outros peers) */
 static void *udp_listener(void *arg) {
     (void)arg;
     char buf[BUFSZ];
     while (1) {
         int n = receive_message(buf, sizeof buf - 1);
-        if (n <= 0) continue;
+        if (n <= 0) continue;  /* ACK/NACK/CFG ou nada */
         buf[n] = '\0';
         printf("\n[CLI] RX «%s»\n> ", buf);
         fflush(stdout);
@@ -35,6 +36,7 @@ static void *udp_listener(void *arg) {
     return NULL;
 }
 
+/* registo TCP + PSK */
 static int tcp_register(const char *srv_ip, int port, const char *psk) {
     int s = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in d = {0};
@@ -53,44 +55,63 @@ static int tcp_register(const char *srv_ip, int port, const char *psk) {
 
 int main(int argc, char **argv) {
     if (argc != 4) {
-        fprintf(stderr, "Usage: %s <server_ip> <tcp_port> <psk>\n",
-                argv[0]);
+        fprintf(stderr, "Usage: %s <server_ip> <tcp_port> <psk>\n", argv[0]);
         return 1;
     }
     const char *ip   = argv[1];
     int         port = atoi(argv[2]);
     const char *psk  = argv[3];
 
-    if (init_protocol_client() != 0) return 1;
-    join_cfg_multicast(0);
+    /* 1) inicia protocolo UDP no porto fixo para P2P */
+    if (init_protocol_server() != 0) return 1;
 
-    pthread_t th;
-    pthread_create(&th, NULL, udp_listener, NULL);
-    pthread_detach(th);
+    /* 2) join multicast ConfigMessage */
+    /* passa o socket UDP ao join */
+    join_cfg_multicast( /* udp_fd = */ 0 );
 
-    /* opcional: inject_packet_loss(30); */
+    /* 3) thread UDP listener */
+    pthread_t th_udp;
+    pthread_create(&th_udp, NULL, udp_listener, NULL);
+    pthread_detach(th_udp);
 
+    /* 4) injeta perda, se quiseres */
+    // inject_packet_loss(30);
+
+    /* 5) registo TCP no servidor */
     int tcp = tcp_register(ip, port, psk);
     if (tcp < 0) return 1;
 
+    /* 6) CLI: suporte a pedidos de config e P2P */
     char line[BUFSZ];
     printf("> "); fflush(stdout);
     while (fgets(line, sizeof line, stdin)) {
+        /* retira newline */
         size_t len = strlen(line);
-        if (len && line[len-1]=='\n') line[--len]='\0';
-        if (!len) { printf("> "); continue; }
-
+        if (len && line[len - 1] == '\n') line[--len] = '\0';
+        if (!len) {
+            printf("> "); continue;
+        }
+        /* comando de configuração via TCP */
         if (!strncmp(line, ":setcfg", 7)) {
             send(tcp, line, (int)len, 0);
             printf("[CLI] pedido de nova config enviado\n> ");
             continue;
         }
-        if (send_message(ip, line, (int)len) < 0)
-            perror("send_message");
-        else
-            printf("[CLI] sent seq\n> ");
+        /* P2P UDP unicast: sintaxe "<dest_ip> <mensagem>" */
+        char *space = strchr(line, ' ');
+        if (space) {
+            *space = '\0';
+            const char *dest_ip = line;
+            const char *msg     = space + 1;
+            if (send_message(dest_ip, msg, (int)strlen(msg)) < 0)
+                perror("send_message");
+            else
+                printf("[CLI] sent seq to %s\n> ", dest_ip);
+            continue;
+        }
+        /* linha inválida */
+        fprintf(stderr, "Invalid input. Use ':setcfg ...' or '<dest_ip> <msg>'\n> ");
     }
-
     close_protocol();
     close(tcp);
     return 0;
