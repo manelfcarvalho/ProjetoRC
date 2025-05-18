@@ -8,23 +8,30 @@
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
-#include <pthread.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <net/if.h>
+#include <pthread.h>
 
+/* extern UDP socket defined in powerudp.c */
+extern int udp_sock;
 
 #define BUFSZ 512
 
+/* Join the ConfigMessage multicast group on udp_sock using explicit interface */
 static void join_cfg_multicast(void) {
     struct ip_mreqn mreq = {0};
-    // grupo multicast
-    inet_pton(AF_INET, PUDP_CFG_MC_ADDR, &mreq.imr_multiaddr);
-    // índice da interface eth0 (garante que o kernel sabe onde enviar o IGMP)
+    // Multicast group address
+    if (inet_pton(AF_INET, PUDP_CFG_MC_ADDR, &mreq.imr_multiaddr) != 1) {
+        perror("inet_pton");
+        exit(1);
+    }
+    // Bind IGMP to eth0 interface
     mreq.imr_ifindex = if_nametoindex("eth0");
     if (mreq.imr_ifindex == 0) {
         perror("if_nametoindex eth0");
         exit(1);
     }
-    // faz o join
     if (setsockopt(udp_sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
                    &mreq, sizeof mreq) < 0) {
         perror("IP_ADD_MEMBERSHIP");
@@ -32,7 +39,7 @@ static void join_cfg_multicast(void) {
     }
 }
 
-/* Thread que apenas processa ACK/NACK/CFG e printa payload de peers */
+/* Listener for UDP messages (ACK/NACK/CFG and peer payload) */
 static void *udp_listener(void *arg) {
     (void)arg;
     char buf[BUFSZ];
@@ -46,18 +53,21 @@ static void *udp_listener(void *arg) {
     return NULL;
 }
 
-/* Registo TCP + PSK */
+/* Register via TCP with PSK */
 static int tcp_register(const char *srv_ip, int port, const char *psk) {
     int s = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in d = { .sin_family = AF_INET,
-                             .sin_port   = htons(port) };
-    inet_pton(AF_INET, srv_ip, &d.sin_addr);
+    struct sockaddr_in d = { .sin_family = AF_INET, .sin_port = htons(port) };
+    if (inet_pton(AF_INET, srv_ip, &d.sin_addr) != 1) {
+        perror("inet_pton srv_ip"); return -1;
+    }
     if (connect(s, (struct sockaddr *)&d, sizeof d) < 0) {
         perror("connect"); return -1;
     }
     RegisterMessage r = {0};
     strncpy(r.psk, psk, sizeof r.psk - 1);
-    send(s, &r, sizeof r, 0);
+    if (send(s, &r, sizeof r, 0) != sizeof r) {
+        perror("send PSK"); close(s); return -1;
+    }
     printf("[CLI] Registered at %s:%d (PSK OK)\n", srv_ip, port);
     return s;
 }
@@ -71,27 +81,33 @@ int main(int argc, char **argv) {
     int         port = atoi(argv[2]);
     const char *psk  = argv[3];
 
-    /* 1) Inicia o socket DATA_PORT (=6001) */
-    if (init_protocol_server() != 0) return 1;
+    /* 1) initialize PowerUDP (UDP socket on port 6001) */
+    if (init_protocol_server() != 0) {
+        fprintf(stderr, "Failed to init PowerUDP\n");
+        return 1;
+    }
 
-    /* 2) Faz join no grupo multicast para configs */
+    /* 2) join multicast group for dynamic config */
     join_cfg_multicast();
 
-    /* 3) Thread UDP listener para peers e configs */
-    pthread_t th;
-    pthread_create(&th, NULL, udp_listener, NULL);
-    pthread_detach(th);
+    /* 3) start UDP listener thread */
+    pthread_t th_udp;
+    if (pthread_create(&th_udp, NULL, udp_listener, NULL) != 0) {
+        perror("pthread_create udp_listener");
+        return 1;
+    }
+    pthread_detach(th_udp);
 
-    /* 4) Registo TCP ao servidor */
+    /* 4) register via TCP to server */
     int tcp = tcp_register(ip, port, psk);
     if (tcp < 0) return 1;
 
-    /* 5) CLI apenas peer-to-peer e :setcfg */
+    /* 5) CLI loop: only peer-to-peer and :setcfg commands */
     char line[BUFSZ];
     printf("> "); fflush(stdout);
     while (fgets(line, sizeof line, stdin)) {
         size_t len = strlen(line);
-        if (len && line[len-1]=='\n') line[--len]='\0';
+        if (len && line[len-1] == '\n') line[--len] = '\0';
         if (!len) { printf("> "); continue; }
 
         if (!strncmp(line, ":setcfg", 7)) {
@@ -99,10 +115,10 @@ int main(int argc, char **argv) {
             printf("[CLI] pedido de nova config enviado\n> ");
             continue;
         }
+
         char *space = strchr(line, ' ');
         if (!space) {
-            fprintf(stderr,
-                "Invalid. Use '<peer_ip> <msg>' or ':setcfg'\n> ");
+            fprintf(stderr, "Invalid. Use '<peer_ip> <msg>' or ':setcfg'\n> ");
             continue;
         }
         *space = '\0';
