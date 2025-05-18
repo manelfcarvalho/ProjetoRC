@@ -9,17 +9,25 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <net/if.h>
+
 
 #define BUFSZ 512
 
-/* Regista no grupo multicast no mesmo socket DATA_PORT */
 static void join_cfg_multicast(void) {
-    struct ip_mreq m;
-    inet_pton(AF_INET, PUDP_CFG_MC_ADDR, &m.imr_multiaddr);
-    m.imr_interface.s_addr = htonl(INADDR_ANY);
+    struct ip_mreqn mreq = {0};
+    // grupo multicast
+    inet_pton(AF_INET, PUDP_CFG_MC_ADDR, &mreq.imr_multiaddr);
+    // índice da interface eth0 (garante que o kernel sabe onde enviar o IGMP)
+    mreq.imr_ifindex = if_nametoindex("eth0");
+    if (mreq.imr_ifindex == 0) {
+        perror("if_nametoindex eth0");
+        exit(1);
+    }
+    // faz o join
     if (setsockopt(udp_sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
-                   &m, sizeof m) < 0) {
-        perror("multicast join");
+                   &mreq, sizeof mreq) < 0) {
+        perror("IP_ADD_MEMBERSHIP");
         exit(1);
     }
 }
