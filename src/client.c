@@ -12,14 +12,17 @@
 #include <netinet/in.h>
 #include <pthread.h>
 
+/* extern UDP socket defined in powerudp.c (remove static qualifier there) */
+extern int udp_sock;
+
 #define BUFSZ 512
 
 /* faz join no grupo multicast para ConfigMessage */
-static void join_cfg_multicast(int udp_fd) {
+static void join_cfg_multicast(void) {
     struct ip_mreq m;
     inet_pton(AF_INET, PUDP_CFG_MC_ADDR, &m.imr_multiaddr);
     m.imr_interface.s_addr = htonl(INADDR_ANY);
-    setsockopt(udp_fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof m);
+    setsockopt(udp_sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof m);
 }
 
 /* listener de pacotes UDP (ACK/NACK/CFG + payload de outros peers) */
@@ -62,36 +65,30 @@ int main(int argc, char **argv) {
     int         port = atoi(argv[2]);
     const char *psk  = argv[3];
 
-    /* 1) inicia protocolo UDP no porto fixo para P2P */
+    /* 1) inicia PowerUDP (socket UDP 6001) */
     if (init_protocol_server() != 0) return 1;
 
-    /* 2) join multicast ConfigMessage */
-    /* passa o socket UDP ao join */
-    join_cfg_multicast( /* udp_fd = */ 0 );
+    /* 2) regista no grupo multicast para configuração dinâmica */
+    join_cfg_multicast();
 
     /* 3) thread UDP listener */
     pthread_t th_udp;
     pthread_create(&th_udp, NULL, udp_listener, NULL);
     pthread_detach(th_udp);
 
-    /* 4) injeta perda, se quiseres */
-    // inject_packet_loss(30);
-
-    /* 5) registo TCP no servidor */
+    /* 4) registo TCP no servidor */
     int tcp = tcp_register(ip, port, psk);
     if (tcp < 0) return 1;
 
-    /* 6) CLI: suporte a pedidos de config e P2P */
+    /* 5) CLI: suporte a pedidos de config e P2P */
     char line[BUFSZ];
     printf("> "); fflush(stdout);
     while (fgets(line, sizeof line, stdin)) {
-        /* retira newline */
         size_t len = strlen(line);
-        if (len && line[len - 1] == '\n') line[--len] = '\0';
-        if (!len) {
-            printf("> "); continue;
-        }
-        /* comando de configuração via TCP */
+        if (len && line[len-1]=='\n') line[--len]='\0';
+        if (!len) { printf("> "); continue; }
+
+        /* comandos de configuração via TCP */
         if (!strncmp(line, ":setcfg", 7)) {
             send(tcp, line, (int)len, 0);
             printf("[CLI] pedido de nova config enviado\n> ");
@@ -109,9 +106,13 @@ int main(int argc, char **argv) {
                 printf("[CLI] sent seq to %s\n> ", dest_ip);
             continue;
         }
-        /* linha inválida */
-        fprintf(stderr, "Invalid input. Use ':setcfg ...' or '<dest_ip> <msg>'\n> ");
+        /* sem espaço: envia ao servidor */
+        if (send_message(ip, line, (int)strlen(line)) < 0)
+            perror("send_message");
+        else
+            printf("[CLI] sent seq to server %s\n> ", ip);
     }
+
     close_protocol();
     close(tcp);
     return 0;
