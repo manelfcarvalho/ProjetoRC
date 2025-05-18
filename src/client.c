@@ -12,26 +12,29 @@
 #include <netinet/in.h>
 #include <net/if.h>
 #include <pthread.h>
+#include <sys/ioctl.h>
 
 /* extern UDP socket defined in powerudp.c */
 extern int udp_sock;
 
 #define BUFSZ 512
 
-/* Join the ConfigMessage multicast group on udp_sock using explicit interface */
+/* Join no grupo multicast para ConfigMessage, usando o IP local de eth0 */
 static void join_cfg_multicast(void) {
-    struct ip_mreqn mreq = {0};
-    // Multicast group address
-    if (inet_pton(AF_INET, PUDP_CFG_MC_ADDR, &mreq.imr_multiaddr) != 1) {
-        perror("inet_pton");
+    struct ifreq ifr = {0};
+    strncpy(ifr.ifr_name, "eth0", IFNAMSIZ);
+
+    // obtém o IP de eth0
+    if (ioctl(udp_sock, SIOCGIFADDR, &ifr) < 0) {
+        perror("SIOCGIFADDR");
         exit(1);
     }
-    // Bind IGMP to eth0 interface
-    mreq.imr_ifindex = if_nametoindex("eth0");
-    if (mreq.imr_ifindex == 0) {
-        perror("if_nametoindex eth0");
-        exit(1);
-    }
+    struct in_addr local = ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr;
+
+    struct ip_mreq mreq;
+    inet_pton(AF_INET, PUDP_CFG_MC_ADDR, &mreq.imr_multiaddr);
+    mreq.imr_interface = local;
+
     if (setsockopt(udp_sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
                    &mreq, sizeof mreq) < 0) {
         perror("IP_ADD_MEMBERSHIP");
