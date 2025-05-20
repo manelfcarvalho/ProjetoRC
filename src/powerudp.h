@@ -12,13 +12,13 @@
 #define PUDP_MAX_RETRY    5
 
 /* flags */
-#define PUDP_F_ACK 0x1
-#define PUDP_F_NAK 0x2
-#define PUDP_F_CFG 0x4
+#define PUDP_F_ACK  0x1
+#define PUDP_F_NAK  0x2
+#define PUDP_F_CFG  0x4
+#define PUDP_F_SYNC 0x8  /* Novo flag para ressincronização */
 
 /* expõe o socket UDP interno para join_multicast */
 extern int udp_sock;
-
 
 /* header */
 typedef struct {
@@ -33,6 +33,12 @@ typedef struct {
     uint8_t  max_retries;
     uint8_t  _pad[3];
 } ConfigMessage;
+
+/* sync message */
+typedef struct {
+    uint32_t last_seq;    /* Última sequência descartada */
+    uint32_t next_seq;    /* Próxima sequência a ser usada */
+} SyncMessage;
 
 /* register message */
 typedef struct {

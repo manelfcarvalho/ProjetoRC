@@ -15,6 +15,7 @@
 
 #define MAX_PENDING 32
 #define MAX_PAYLOAD 512
+#define MAX_SEQ_GAP 100  /* Máxima diferença aceitável entre sequências */
 
 typedef struct {
     uint32_t            seq;
@@ -43,6 +44,24 @@ static int      drop_probability= 0;
 /* last event for CLI sync */
 static int      last_evt_status = 0;  /* 1=ACK, -1=DROP */
 static uint32_t last_evt_seq    = 0;
+
+/* Função para enviar mensagem de sincronização */
+static void send_sync_message(const struct sockaddr_in *dst, uint32_t last_seq, uint32_t next_seq) {
+    char frame[sizeof(PUDPHeader) + sizeof(SyncMessage)];
+    PUDPHeader *h = (PUDPHeader*)frame;
+    h->seq = htonl(next_seq);
+    h->flags = PUDP_F_SYNC;
+    
+    SyncMessage *sync = (SyncMessage*)(frame + sizeof(PUDPHeader));
+    sync->last_seq = htonl(last_seq);
+    sync->next_seq = htonl(next_seq);
+    
+    sendto(udp_sock, frame, sizeof(frame), 0,
+           (struct sockaddr*)dst, sizeof(*dst));
+    
+    fprintf(stderr, "[PUDP] Sent SYNC message (last=%u, next=%u)\n", 
+            last_seq, next_seq);
+}
 
 /* get current time in milliseconds */
 static uint32_t now_ms(void) {
@@ -74,6 +93,10 @@ static void *retrans_loop(void *arg) {
                 fprintf(stderr,
                     "[PUDP] seq %u DROPPED after %d tries\n",
                     pend[i].seq, pend[i].retries);
+                    
+                /* Envia mensagem de sincronização */
+                send_sync_message(&pend[i].dst, pend[i].seq, seq_tx);
+                
                 last_evt_status = -1;
                 last_evt_seq    = pend[i].seq;
                 pend[i].in_use  = 0;
@@ -230,12 +253,39 @@ int receive_message(void *buf, int buflen) {
             apply_config((ConfigMessage*)(frame + sizeof(*h)));
         return 0;
     }
+    if (h->flags & PUDP_F_SYNC) {
+        if ((size_t)n >= sizeof(*h) + sizeof(SyncMessage)) {
+            SyncMessage *sync = (SyncMessage*)(frame + sizeof(*h));
+            uint32_t last_seq = ntohl(sync->last_seq);
+            uint32_t next_seq = ntohl(sync->next_seq);
+            
+            if (expected_seq <= last_seq) {
+                expected_seq = next_seq;
+                fprintf(stderr, "[PUDP] Resync: expected_seq updated to %u\n", 
+                        expected_seq);
+            }
+        }
+        return 0;
+    }
+
+    /* Verifica se a diferença entre sequências é muito grande */
+    if (h->seq > expected_seq && h->seq - expected_seq > MAX_SEQ_GAP) {
+        fprintf(stderr, "[PUDP] Large sequence gap detected (%u -> %u)\n",
+                expected_seq, h->seq);
+        /* Solicita ressincronização */
+        PUDPHeader sync_req = { htonl(expected_seq), PUDP_F_SYNC, {0} };
+        sendto(udp_sock, &sync_req, sizeof sync_req, 0,
+               (struct sockaddr*)&src, sizeof src);
+        return 0;
+    }
+
     if (h->seq != expected_seq) {
         PUDPHeader nack = { htonl(expected_seq), PUDP_F_NAK, {0} };
         sendto(udp_sock, &nack, sizeof nack, 0,
                (struct sockaddr*)&src, sizeof src);
         return 0;
     }
+
     expected_seq++;
     PUDPHeader ack = { htonl(h->seq), PUDP_F_ACK, {0} };
     sendto(udp_sock, &ack, sizeof ack, 0,
