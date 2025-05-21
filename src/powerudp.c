@@ -45,6 +45,15 @@ static int      drop_probability= 0;
 static int      last_evt_status = 0;  /* 1=ACK, -1=DROP */
 static uint32_t last_evt_seq    = 0;
 
+/* Função auxiliar para sleep em milissegundos */
+static void msleep(unsigned int ms) {
+    struct timespec ts = {
+        .tv_sec = ms / 1000,
+        .tv_nsec = (ms % 1000) * 1000000
+    };
+    nanosleep(&ts, NULL);
+}
+
 /* Função para enviar mensagem de sincronização */
 static void send_sync_message(const struct sockaddr_in *dst, uint32_t last_seq, uint32_t next_seq) {
     char frame[sizeof(PUDPHeader) + sizeof(SyncMessage)];
@@ -213,7 +222,7 @@ int send_message(const char *dest_ip, const void *buf, int len) {
     // Se houver muitas mensagens pendentes, espera um pouco
     if (pending_count > MAX_PENDING/2) {
         pthread_mutex_unlock(&pend_mtx);
-        usleep(5000);  // 5ms delay
+        msleep(5);  // 5ms delay
         pthread_mutex_lock(&pend_mtx);
     }
     
@@ -263,7 +272,7 @@ int receive_message(void *buf, int buflen) {
         pthread_mutex_unlock(&pend_mtx);
         
         // Pequeno delay após ACK para permitir processamento
-        usleep(1000);  // 1ms delay
+        msleep(1);  // 1ms delay
         return 0;
     }
     if (h->flags & PUDP_F_NAK) {
@@ -316,7 +325,7 @@ int receive_message(void *buf, int buflen) {
         if (buf) memcpy(buf, frame + sizeof(*h), dlen);
         
         // Pequeno delay para processamento
-        usleep(1000);  // 1ms delay
+        msleep(1);  // 1ms delay
         
         return dlen;
     } else if (h->seq < expected_seq) {
