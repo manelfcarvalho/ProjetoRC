@@ -26,8 +26,23 @@ static void multicast_config(uint16_t to_ms, uint8_t max_rtx)
         return;
     }
 
+    // Configura timeout para recepção de ACKs
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 200000;  // 200ms timeout
+    if (setsockopt(mc_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        perror("SO_RCVTIMEO");
+        return;
+    }
+
+    // Buffer para receber ACKs
+    char ack_buf[sizeof(PUDPHeader)];
+    struct sockaddr_in from;
+    socklen_t fromlen = sizeof(from);
+
     // Envia a mensagem várias vezes para garantir que todos os clientes recebam
-    for (int i = 0; i < 3; i++) {
+    int max_attempts = 5;  // Aumentado para 5 tentativas
+    for (int i = 0; i < max_attempts; i++) {
         char frame[sizeof(PUDPHeader) + sizeof(ConfigMessage)];
         PUDPHeader *h = (PUDPHeader *)frame;
         h->seq   = htonl(0);
@@ -44,8 +59,37 @@ static void multicast_config(uint16_t to_ms, uint8_t max_rtx)
             continue;
         }
 
-        printf("[SRV] Sent config (try %d/3): timeout=%u ms, retries=%u\n",
-               i+1, to_ms, max_rtx);
+        printf("[SRV] Sent config (try %d/%d): timeout=%u ms, retries=%u\n",
+               i+1, max_attempts, to_ms, max_rtx);
+
+        // Espera por ACKs (opcional - pode ser removido se causar problemas)
+        int received_acks = 0;
+        while (1) {
+            int n = recvfrom(mc_sock, ack_buf, sizeof(ack_buf), 0,
+                            (struct sockaddr *)&from, &fromlen);
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;  // Timeout - próxima tentativa
+                }
+                perror("recvfrom");
+                break;
+            }
+            
+            PUDPHeader *ack_h = (PUDPHeader *)ack_buf;
+            if (ack_h->flags & PUDP_F_ACK) {
+                char ip[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &from.sin_addr, ip, sizeof(ip));
+                printf("[SRV] Received config ACK from %s\n", ip);
+                received_acks++;
+            }
+        }
+
+        if (received_acks > 0) {
+            printf("[SRV] Received %d ACKs for config message\n", received_acks);
+            if (i < max_attempts - 1) {
+                printf("[SRV] Continuing with remaining attempts for reliability\n");
+            }
+        }
 
         // Pequeno delay entre retransmissões
         struct timespec ts = {

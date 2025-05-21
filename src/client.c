@@ -21,13 +21,40 @@ extern int udp_sock;
 
 /* Join no grupo multicast para ConfigMessage */
 static void join_cfg_multicast(void) {
+    // Permite múltiplos sockets no mesmo endereço
+    int yes = 1;
+    if (setsockopt(udp_sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) {
+        perror("SO_REUSEADDR");
+        exit(1);
+    }
+
+    // Configura o socket para receber multicast
     struct ip_mreq mreq;
     inet_pton(AF_INET, PUDP_CFG_MC_ADDR, &mreq.imr_multiaddr);
     mreq.imr_interface.s_addr = htonl(INADDR_ANY);
 
+    // Adiciona opção para especificar interface
+    char *iface = getenv("PUDP_IFACE");
+    if (iface != NULL) {
+        struct ifreq ifr;
+        strncpy(ifr.ifr_name, iface, IFNAMSIZ-1);
+        if (ioctl(udp_sock, SIOCGIFADDR, &ifr) >= 0) {
+            mreq.imr_interface = ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr;
+            printf("[CLI] Using interface %s for multicast\n", iface);
+        }
+    }
+
     if (setsockopt(udp_sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
                    &mreq, sizeof mreq) < 0) {
         perror("IP_ADD_MEMBERSHIP");
+        exit(1);
+    }
+
+    // Configura o socket para permitir broadcast/multicast
+    int multicast_ttl = 5;
+    if (setsockopt(udp_sock, IPPROTO_IP, IP_MULTICAST_TTL, 
+                   &multicast_ttl, sizeof(multicast_ttl)) < 0) {
+        perror("IP_MULTICAST_TTL");
         exit(1);
     }
 
@@ -38,10 +65,42 @@ static void join_cfg_multicast(void) {
 static void *udp_listener(void *arg) {
     (void)arg;
     char buf[BUFSZ];
+    struct sockaddr_in from;
+    socklen_t fromlen = sizeof(from);
+
     while (1) {
-        int n = receive_message(buf, sizeof buf - 1);
+        int n = recvfrom(udp_sock, buf, sizeof(buf), 0,
+                        (struct sockaddr *)&from, &fromlen);
         if (n <= 0) continue;
-        buf[n] = '\0';
+
+        // Processa o header PowerUDP
+        if (n >= sizeof(PUDPHeader)) {
+            PUDPHeader *h = (PUDPHeader *)buf;
+            
+            // Processa mensagem de configuração
+            if (h->flags & PUDP_F_CFG && n >= sizeof(PUDPHeader) + sizeof(ConfigMessage)) {
+                ConfigMessage *cfg = (ConfigMessage *)(buf + sizeof(PUDPHeader));
+                printf("\n[CLI] Received config: timeout=%u ms, retries=%u\n> ",
+                       cfg->base_timeout_ms, cfg->max_retries);
+                
+                // Envia ACK para a configuração
+                PUDPHeader ack = {
+                    .seq = h->seq,
+                    .flags = PUDP_F_ACK,
+                };
+                
+                if (sendto(udp_sock, &ack, sizeof(ack), 0,
+                          (struct sockaddr *)&from, fromlen) < 0) {
+                    perror("sendto ACK");
+                }
+                
+                fflush(stdout);
+                continue;
+            }
+        }
+
+        // Processa mensagens normais
+        if (n < BUFSZ) buf[n] = '\0';
         printf("\n[CLI] RX «%s»\n> ", buf);
         fflush(stdout);
     }

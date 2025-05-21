@@ -183,6 +183,8 @@ static void ack_pending(uint32_t seq) {
 static void apply_config(const ConfigMessage *cfg) {
     base_timeout_ms = cfg->base_timeout_ms;
     max_retries     = cfg->max_retries;
+    printf("[PUDP] Applied new config: timeout=%u ms, retries=%u\n",
+           base_timeout_ms, max_retries);
 }
 
 static int resend_now(uint32_t seq) {
@@ -302,6 +304,14 @@ int receive_message(void *buf, int buflen) {
     PUDPHeader *h = (PUDPHeader*)frame;
     h->seq = ntohl(h->seq);
 
+    if (h->flags & PUDP_F_CFG) {
+        if ((size_t)n >= sizeof(*h) + sizeof(ConfigMessage)) {
+            printf("[PUDP] Received config message\n");
+            apply_config((ConfigMessage*)(frame + sizeof(*h)));
+        }
+        return 0;
+    }
+
     char src_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &src.sin_addr, src_ip, sizeof(src_ip));
 
@@ -317,12 +327,6 @@ int receive_message(void *buf, int buflen) {
 
     if (h->flags & PUDP_F_NAK) {
         resend_now(h->seq);
-        return 0;
-    }
-
-    if (h->flags & PUDP_F_CFG) {
-        if ((size_t)n >= sizeof(*h) + sizeof(ConfigMessage))
-            apply_config((ConfigMessage*)(frame + sizeof(*h)));
         return 0;
     }
 
