@@ -63,7 +63,6 @@ static void send_ack(const struct sockaddr_in *dst, uint32_t seq);
 static void send_nak(const struct sockaddr_in *dst, uint32_t expected_seq);
 static void send_sync_message(const struct sockaddr_in *dst, uint32_t last_seq, uint32_t next_seq);
 static uint32_t get_peer_seq(struct in_addr addr);
-static void update_peer_seq(struct in_addr addr, uint32_t seq);
 static void add_pending(uint32_t seq, const char *frame, int len, const struct sockaddr_in *dst);
 static void ack_pending(uint32_t seq);
 static int common_udp_init(uint16_t port);
@@ -149,29 +148,6 @@ static uint32_t get_peer_seq(struct in_addr addr) {
     }
     pthread_mutex_unlock(&seq_mtx);
     return 1;
-}
-
-static void update_peer_seq(struct in_addr addr, uint32_t seq) {
-    pthread_mutex_lock(&seq_mtx);
-    for (int i = 0; i < MAX_PEERS; i++) {
-        if (peer_states[i].in_use && 
-            peer_states[i].addr.s_addr == addr.s_addr) {
-            peer_states[i].last_seen_seq = seq;
-            pthread_mutex_unlock(&seq_mtx);
-            return;
-        }
-    }
-    
-    // Se não encontrou o peer, adiciona
-    for (int i = 0; i < MAX_PEERS; i++) {
-        if (!peer_states[i].in_use) {
-            peer_states[i].addr = addr;
-            peer_states[i].last_seen_seq = seq;
-            peer_states[i].in_use = 1;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&seq_mtx);
 }
 
 static void add_pending(uint32_t seq, const char *frame, int len,
