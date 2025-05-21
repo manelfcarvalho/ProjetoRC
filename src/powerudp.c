@@ -29,23 +29,23 @@ typedef struct {
     int                 in_use;
 } Pending;
 
-static Pending          pend[MAX_PENDING];
+/* Global mutexes */
 static pthread_mutex_t  pend_mtx        = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t  seq_mtx         = PTHREAD_MUTEX_INITIALIZER;
+
+/* Global state */
+static Pending         pend[MAX_PENDING];
 static uint32_t        global_seq       = 1;  // Sequência global compartilhada
+static uint32_t        base_timeout_ms  = PUDP_BASE_TO_MS;
+static uint8_t         max_retries      = PUDP_MAX_RETRY;
+static int             drop_probability = 0;
 
 /* UDP socket for both client and server roles */
 int udp_sock = -1;
 
-/* sequencing & timeouts */
-static pthread_mutex_t  seq_mtx         = PTHREAD_MUTEX_INITIALIZER;
-static uint32_t base_timeout_ms = PUDP_BASE_TO_MS;
-static uint8_t  max_retries     = PUDP_MAX_RETRY;
-static int      drop_probability= 0;
-
 /* last event for CLI sync */
-static int      last_evt_status = 0;  /* 1=ACK, -1=DROP */
-static uint32_t last_evt_seq    = 0;
+static int             last_evt_status  = 0;  /* 1=ACK, -1=DROP */
+static uint32_t        last_evt_seq     = 0;
 
 /* Mapa de última sequência vista por IP */
 typedef struct {
