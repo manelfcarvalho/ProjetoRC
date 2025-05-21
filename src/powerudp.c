@@ -16,6 +16,7 @@
 #define MAX_PENDING 32
 #define MAX_PAYLOAD 512
 #define MAX_SEQ_GAP 100
+#define MAX_PEERS 256
 
 typedef struct {
     uint32_t            seq;
@@ -36,6 +37,16 @@ static pthread_mutex_t  seq_mtx         = PTHREAD_MUTEX_INITIALIZER;
 int udp_sock = -1;
 
 /* sequencing & timeouts */
+static pthread_mutex_t  tx_seq_mtx      = PTHREAD_MUTEX_INITIALIZER;
+
+typedef struct {
+    struct in_addr addr;
+    uint32_t      tx_seq;
+    int           in_use;
+} PeerTxSeq;
+
+static PeerTxSeq tx_seqs[MAX_PEERS];
+
 static uint32_t seq_tx          = 1;
 static uint32_t base_timeout_ms = PUDP_BASE_TO_MS;
 static uint8_t  max_retries     = PUDP_MAX_RETRY;
@@ -46,7 +57,6 @@ static int      last_evt_status = 0;  /* 1=ACK, -1=DROP */
 static uint32_t last_evt_seq    = 0;
 
 /* Mapa de sequências por IP */
-#define MAX_PEERS 256
 typedef struct {
     struct in_addr addr;
     uint32_t      expected_seq;
@@ -69,6 +79,7 @@ static int common_udp_init(uint16_t port);
 static void *retrans_loop(void *arg);
 static void apply_config(const ConfigMessage *cfg);
 static int resend_now(uint32_t seq);
+static uint32_t get_tx_seq(struct in_addr addr);
 
 /* Implementações das funções */
 static uint32_t now_ms(void) {
@@ -211,7 +222,35 @@ static int resend_now(uint32_t seq) {
     return -1;
 }
 
+static uint32_t get_tx_seq(struct in_addr addr) {
+    pthread_mutex_lock(&tx_seq_mtx);
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (tx_seqs[i].in_use && 
+            tx_seqs[i].addr.s_addr == addr.s_addr) {
+            uint32_t seq = tx_seqs[i].tx_seq++;
+            pthread_mutex_unlock(&tx_seq_mtx);
+            return seq;
+        }
+    }
+    
+    // New peer, find free slot
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (!tx_seqs[i].in_use) {
+            tx_seqs[i].addr = addr;
+            tx_seqs[i].tx_seq = 2;  // Start with 1
+            tx_seqs[i].in_use = 1;
+            pthread_mutex_unlock(&tx_seq_mtx);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&tx_seq_mtx);
+    return 1;
+}
+
 static int common_udp_init(uint16_t port) {
+    // Initialize tx_seqs array
+    memset(tx_seqs, 0, sizeof(tx_seqs));
+    
     udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (udp_sock < 0) return -1;
     struct sockaddr_in a = {
@@ -361,13 +400,6 @@ int receive_message(void *buf, int buflen) {
 int send_message(const char *dest_ip, const void *buf, int len) {
     if (len > MAX_PAYLOAD) { errno = EINVAL; return -1; }
     
-    char frame[sizeof(PUDPHeader) + MAX_PAYLOAD];
-    PUDPHeader *h = (PUDPHeader*)frame;
-    h->seq   = htonl(seq_tx++);
-    h->flags = 0;
-    memcpy(frame + sizeof(*h), buf, len);
-    int flen = sizeof(*h) + len;
-
     struct sockaddr_in dst = {
         .sin_family = AF_INET,
         .sin_port   = htons(PUDP_DATA_PORT)
@@ -376,6 +408,13 @@ int send_message(const char *dest_ip, const void *buf, int len) {
         errno = EINVAL;
         return -1;
     }
+
+    char frame[sizeof(PUDPHeader) + MAX_PAYLOAD];
+    PUDPHeader *h = (PUDPHeader*)frame;
+    h->seq   = htonl(get_tx_seq(dst.sin_addr));
+    h->flags = 0;
+    memcpy(frame + sizeof(*h), buf, len);
+    int flen = sizeof(*h) + len;
 
     fprintf(stderr, "[PUDP] Sending seq=%u to %s\n", 
             ntohl(h->seq), dest_ip);
