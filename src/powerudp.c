@@ -201,6 +201,22 @@ int inject_packet_loss(int pct) {
 
 int send_message(const char *dest_ip, const void *buf, int len) {
     if (len > MAX_PAYLOAD) { errno = EINVAL; return -1; }
+    
+    pthread_mutex_lock(&pend_mtx);
+    
+    // Verifica se há muitas mensagens pendentes
+    int pending_count = 0;
+    for (int i = 0; i < MAX_PENDING; ++i) {
+        if (pend[i].in_use) pending_count++;
+    }
+    
+    // Se houver muitas mensagens pendentes, espera um pouco
+    if (pending_count > MAX_PENDING/2) {
+        pthread_mutex_unlock(&pend_mtx);
+        usleep(5000);  // 5ms delay
+        pthread_mutex_lock(&pend_mtx);
+    }
+    
     char frame[sizeof(PUDPHeader) + MAX_PAYLOAD];
     PUDPHeader *h = (PUDPHeader*)frame;
     h->seq   = htonl(seq_tx++);
@@ -213,11 +229,11 @@ int send_message(const char *dest_ip, const void *buf, int len) {
         .sin_port   = htons(PUDP_DATA_PORT)
     };
     if (inet_pton(AF_INET, dest_ip, &dst.sin_addr) != 1) {
+        pthread_mutex_unlock(&pend_mtx);
         errno = EINVAL;
         return -1;
     }
 
-    pthread_mutex_lock(&pend_mtx);
     add_pending(ntohl(h->seq), frame, flen, &dst);
     pthread_mutex_unlock(&pend_mtx);
 
@@ -225,6 +241,7 @@ int send_message(const char *dest_ip, const void *buf, int len) {
         fprintf(stderr, "[PUDP]  **SIM DROP %d%%**\n", drop_probability);
         return len;
     }
+    
     return sendto(udp_sock, frame, flen, 0,
                   (struct sockaddr*)&dst, sizeof dst) == flen ? len : -1;
 }
@@ -241,7 +258,12 @@ int receive_message(void *buf, int buflen) {
     h->seq = ntohl(h->seq);
 
     if (h->flags & PUDP_F_ACK) {
+        pthread_mutex_lock(&pend_mtx);
         ack_pending(h->seq);
+        pthread_mutex_unlock(&pend_mtx);
+        
+        // Pequeno delay após ACK para permitir processamento
+        usleep(1000);  // 1ms delay
         return 0;
     }
     if (h->flags & PUDP_F_NAK) {
@@ -279,22 +301,37 @@ int receive_message(void *buf, int buflen) {
         return 0;
     }
 
-    if (h->seq != expected_seq) {
+    if (h->seq == expected_seq) {
+        // Processa a mensagem atual
+        expected_seq++;
+        
+        // Envia ACK
+        PUDPHeader ack = { htonl(h->seq), PUDP_F_ACK, {0} };
+        sendto(udp_sock, &ack, sizeof ack, 0,
+               (struct sockaddr*)&src, sizeof src);
+
+        // Copia os dados
+        int dlen = n - (int)sizeof(*h);
+        if (dlen > buflen) dlen = buflen;
+        if (buf) memcpy(buf, frame + sizeof(*h), dlen);
+        
+        // Pequeno delay para processamento
+        usleep(1000);  // 1ms delay
+        
+        return dlen;
+    } else if (h->seq < expected_seq) {
+        // Mensagem duplicada ou antiga, reenvia ACK
+        PUDPHeader ack = { htonl(h->seq), PUDP_F_ACK, {0} };
+        sendto(udp_sock, &ack, sizeof ack, 0,
+               (struct sockaddr*)&src, sizeof src);
+        return 0;
+    } else {
+        // Sequência futura, envia NACK
         PUDPHeader nack = { htonl(expected_seq), PUDP_F_NAK, {0} };
         sendto(udp_sock, &nack, sizeof nack, 0,
                (struct sockaddr*)&src, sizeof src);
         return 0;
     }
-
-    expected_seq++;
-    PUDPHeader ack = { htonl(h->seq), PUDP_F_ACK, {0} };
-    sendto(udp_sock, &ack, sizeof ack, 0,
-           (struct sockaddr*)&src, sizeof src);
-
-    int dlen = n - (int)sizeof(*h);
-    if (dlen > buflen) dlen = buflen;
-    if (buf) memcpy(buf, frame + sizeof(*h), dlen);
-    return dlen;
 }
 
 int powerudp_pending_count(void) {
