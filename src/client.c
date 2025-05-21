@@ -74,11 +74,11 @@ static void *udp_listener(void *arg) {
         if (n <= 0) continue;
 
         // Processa o header PowerUDP
-        if (n >= sizeof(PUDPHeader)) {
+        if (n >= (int)sizeof(PUDPHeader)) {
             PUDPHeader *h = (PUDPHeader *)buf;
             
             // Processa mensagem de configuração
-            if (h->flags & PUDP_F_CFG && n >= sizeof(PUDPHeader) + sizeof(ConfigMessage)) {
+            if (h->flags & PUDP_F_CFG && n >= (int)(sizeof(PUDPHeader) + sizeof(ConfigMessage))) {
                 ConfigMessage *cfg = (ConfigMessage *)(buf + sizeof(PUDPHeader));
                 printf("\n[CLI] Received config: timeout=%u ms, retries=%u\n> ",
                        cfg->base_timeout_ms, cfg->max_retries);
