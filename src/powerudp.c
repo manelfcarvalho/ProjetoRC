@@ -32,6 +32,7 @@ typedef struct {
 static Pending          pend[MAX_PENDING];
 static pthread_mutex_t  pend_mtx        = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t  seq_mtx         = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t        global_seq       = 1;  // Sequência global compartilhada
 
 /* UDP socket for both client and server roles */
 int udp_sock = -1;
@@ -56,14 +57,14 @@ static int      drop_probability= 0;
 static int      last_evt_status = 0;  /* 1=ACK, -1=DROP */
 static uint32_t last_evt_seq    = 0;
 
-/* Mapa de sequências por IP */
+/* Mapa de última sequência vista por IP */
 typedef struct {
     struct in_addr addr;
-    uint32_t      expected_seq;
+    uint32_t      last_seen_seq;  // Última sequência vista deste peer
     int           in_use;
-} PeerSeq;
+} PeerState;
 
-static PeerSeq peer_seqs[MAX_PEERS];
+static PeerState peer_states[MAX_PEERS];
 
 /* Declarações antecipadas de funções */
 static uint32_t now_ms(void);
@@ -72,7 +73,7 @@ static void send_ack(const struct sockaddr_in *dst, uint32_t seq);
 static void send_nak(const struct sockaddr_in *dst, uint32_t expected_seq);
 static void send_sync_message(const struct sockaddr_in *dst, uint32_t last_seq, uint32_t next_seq);
 static uint32_t get_peer_seq(struct in_addr addr);
-static void update_peer_seq(struct in_addr addr, uint32_t new_seq);
+static void update_peer_seq(struct in_addr addr, uint32_t seq);
 static void add_pending(uint32_t seq, const char *frame, int len, const struct sockaddr_in *dst);
 static void ack_pending(uint32_t seq);
 static int common_udp_init(uint16_t port);
@@ -80,6 +81,7 @@ static void *retrans_loop(void *arg);
 static void apply_config(const ConfigMessage *cfg);
 static int resend_now(uint32_t seq);
 static uint32_t get_tx_seq(struct in_addr addr);
+static uint32_t get_next_seq(void);
 
 /* Implementações das funções */
 static uint32_t now_ms(void) {
@@ -127,23 +129,30 @@ static void send_sync_message(const struct sockaddr_in *dst, uint32_t last_seq, 
             last_seq, next_seq);
 }
 
+static uint32_t get_next_seq(void) {
+    pthread_mutex_lock(&seq_mtx);
+    uint32_t seq = global_seq++;
+    pthread_mutex_unlock(&seq_mtx);
+    return seq;
+}
+
 static uint32_t get_peer_seq(struct in_addr addr) {
     pthread_mutex_lock(&seq_mtx);
     for (int i = 0; i < MAX_PEERS; i++) {
-        if (peer_seqs[i].in_use && 
-            peer_seqs[i].addr.s_addr == addr.s_addr) {
-            uint32_t seq = peer_seqs[i].expected_seq;
+        if (peer_states[i].in_use && 
+            peer_states[i].addr.s_addr == addr.s_addr) {
+            uint32_t next_expected = peer_states[i].last_seen_seq + 1;
             pthread_mutex_unlock(&seq_mtx);
-            return seq;
+            return next_expected;
         }
     }
     
     // Novo peer, procura slot livre
     for (int i = 0; i < MAX_PEERS; i++) {
-        if (!peer_seqs[i].in_use) {
-            peer_seqs[i].addr = addr;
-            peer_seqs[i].expected_seq = 1;
-            peer_seqs[i].in_use = 1;
+        if (!peer_states[i].in_use) {
+            peer_states[i].addr = addr;
+            peer_states[i].last_seen_seq = 0;  // Começa esperando seq 1
+            peer_states[i].in_use = 1;
             pthread_mutex_unlock(&seq_mtx);
             return 1;
         }
@@ -152,14 +161,24 @@ static uint32_t get_peer_seq(struct in_addr addr) {
     return 1;
 }
 
-static void update_peer_seq(struct in_addr addr, uint32_t new_seq) {
+static void update_peer_seq(struct in_addr addr, uint32_t seq) {
     pthread_mutex_lock(&seq_mtx);
     for (int i = 0; i < MAX_PEERS; i++) {
-        if (peer_seqs[i].in_use && 
-            peer_seqs[i].addr.s_addr == addr.s_addr) {
-            peer_seqs[i].expected_seq = new_seq;
+        if (peer_states[i].in_use && 
+            peer_states[i].addr.s_addr == addr.s_addr) {
+            peer_states[i].last_seen_seq = seq;
             pthread_mutex_unlock(&seq_mtx);
             return;
+        }
+    }
+    
+    // Se não encontrou o peer, adiciona
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (!peer_states[i].in_use) {
+            peer_states[i].addr = addr;
+            peer_states[i].last_seen_seq = seq;
+            peer_states[i].in_use = 1;
+            break;
         }
     }
     pthread_mutex_unlock(&seq_mtx);
@@ -248,8 +267,9 @@ static uint32_t get_tx_seq(struct in_addr addr) {
 }
 
 static int common_udp_init(uint16_t port) {
-    // Initialize tx_seqs array
-    memset(tx_seqs, 0, sizeof(tx_seqs));
+    // Inicializa estruturas
+    memset(peer_states, 0, sizeof(peer_states));
+    global_seq = 1;
     
     udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (udp_sock < 0) return -1;
@@ -411,7 +431,7 @@ int send_message(const char *dest_ip, const void *buf, int len) {
 
     char frame[sizeof(PUDPHeader) + MAX_PAYLOAD];
     PUDPHeader *h = (PUDPHeader*)frame;
-    h->seq   = htonl(get_tx_seq(dst.sin_addr));
+    h->seq   = htonl(get_next_seq());  // Usa sequência global
     h->flags = 0;
     memcpy(frame + sizeof(*h), buf, len);
     int flen = sizeof(*h) + len;
