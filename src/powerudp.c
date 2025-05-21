@@ -73,7 +73,7 @@ static void *retrans_loop(void *arg);
 static void apply_config(const ConfigMessage *cfg);
 static int resend_now(uint32_t seq);
 static uint32_t get_next_seq(void);
-static void update_all_peers_seq(uint32_t seq);
+static void update_all_peers_seq(uint32_t seq, struct in_addr *skip_addr);
 static void broadcast_sync(uint32_t seq);
 
 /* Implementações das funções */
@@ -300,13 +300,19 @@ static void *retrans_loop(void *arg) {
     return NULL;
 }
 
-static void update_all_peers_seq(uint32_t seq) {
+static void update_all_peers_seq(uint32_t seq, struct in_addr *skip_addr) {
     pthread_mutex_lock(&seq_mtx);
     for (int i = 0; i < MAX_PEERS; i++) {
-        if (peer_states[i].in_use && peer_states[i].last_seen_seq < seq) {
-            peer_states[i].last_seen_seq = seq;
-            fprintf(stderr, "[PUDP] Updated peer %s to seq=%u\n",
-                    inet_ntoa(peer_states[i].addr), seq);
+        if (peer_states[i].in_use) {
+            // Se skip_addr for fornecido, não atualiza esse peer
+            if (skip_addr && peer_states[i].addr.s_addr == skip_addr->s_addr) {
+                continue;
+            }
+            if (peer_states[i].last_seen_seq < seq) {
+                peer_states[i].last_seen_seq = seq;
+                fprintf(stderr, "[PUDP] Updated peer %s to seq=%u\n",
+                        inet_ntoa(peer_states[i].addr), seq);
+            }
         }
     }
     pthread_mutex_unlock(&seq_mtx);
@@ -360,12 +366,13 @@ int receive_message(void *buf, int buflen) {
         if ((size_t)n >= sizeof(*h) + sizeof(SyncMessage)) {
             SyncMessage *sync = (SyncMessage*)(frame + sizeof(*h));
             uint32_t next_seq = ntohl(sync->next_seq);
+            uint32_t last_seq = ntohl(sync->last_seq);
             
-            // Atualiza todos os peers para a nova sequência
-            if (next_seq > peer_expected_seq) {
-                update_all_peers_seq(next_seq - 1);
+            // Atualiza todos os peers exceto o remetente
+            if (last_seq > peer_expected_seq - 1) {
+                update_all_peers_seq(last_seq, &src.sin_addr);
                 fprintf(stderr, "[PUDP] Resync from %s: all peers updated to seq=%u\n",
-                        src_ip, next_seq - 1);
+                        src_ip, last_seq);
             }
             
             // Confirma recebimento da mensagem de sync
@@ -378,13 +385,13 @@ int receive_message(void *buf, int buflen) {
     if (h->seq > peer_expected_seq && h->seq - peer_expected_seq > MAX_SEQ_GAP) {
         fprintf(stderr, "[PUDP] Large sequence gap from %s (%u -> %u), requesting resync\n",
                 src_ip, peer_expected_seq, h->seq);
-        send_sync_message(&src, peer_expected_seq, h->seq);
+        send_sync_message(&src, peer_expected_seq - 1, h->seq);
         return 0;
     }
 
     if (h->seq == peer_expected_seq) {
         // Atualiza todos os peers quando uma mensagem é processada com sucesso
-        update_all_peers_seq(h->seq);
+        update_all_peers_seq(h->seq, NULL);
         send_ack(&src, h->seq);
 
         fprintf(stderr, "[PUDP] Processing seq=%u from %s\n", h->seq, src_ip);
