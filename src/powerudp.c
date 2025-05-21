@@ -11,6 +11,8 @@
 #include <pthread.h>
 #include <sys/time.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <net/if.h>
 #include <time.h>
 
 #define MAX_PENDING 32
@@ -39,6 +41,7 @@ static uint32_t        global_seq       = 1;  // Sequência global compartilhada
 static uint32_t        base_timeout_ms  = PUDP_BASE_TO_MS;
 static uint8_t         max_retries      = PUDP_MAX_RETRY;
 static int             drop_probability = 0;
+static struct sockaddr_in mc_addr;  // Endereço multicast para sync
 
 /* UDP socket for both client and server roles */
 int udp_sock = -1;
@@ -71,6 +74,7 @@ static void apply_config(const ConfigMessage *cfg);
 static int resend_now(uint32_t seq);
 static uint32_t get_next_seq(void);
 static void update_all_peers_seq(uint32_t seq);
+static void broadcast_sync(uint32_t seq);
 
 /* Implementações das funções */
 static uint32_t now_ms(void) {
@@ -207,19 +211,52 @@ static int resend_now(uint32_t seq) {
     return -1;
 }
 
+static void broadcast_sync(uint32_t seq) {
+    // Envia mensagem de sync por multicast para todos os clientes
+    char frame[sizeof(PUDPHeader) + sizeof(SyncMessage)];
+    PUDPHeader *h = (PUDPHeader*)frame;
+    h->seq = htonl(seq);
+    h->flags = PUDP_F_SYNC;
+    
+    SyncMessage *sync = (SyncMessage*)(frame + sizeof(PUDPHeader));
+    sync->last_seq = htonl(seq);
+    sync->next_seq = htonl(seq + 1);
+    
+    sendto(udp_sock, frame, sizeof(frame), 0,
+           (struct sockaddr*)&mc_addr, sizeof(mc_addr));
+    
+    fprintf(stderr, "[PUDP] Broadcast SYNC message for seq=%u\n", seq);
+}
+
 static int common_udp_init(uint16_t port) {
     // Inicializa estruturas
     memset(peer_states, 0, sizeof(peer_states));
     global_seq = 1;
     
+    // Configura socket UDP
     udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (udp_sock < 0) return -1;
+
+    // Permite reutilização do endereço
+    int yes = 1;
+    if (setsockopt(udp_sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) {
+        perror("SO_REUSEADDR");
+        return -1;
+    }
+
+    // Configura endereço multicast
+    mc_addr.sin_family = AF_INET;
+    mc_addr.sin_port = htons(PUDP_DATA_PORT);
+    inet_pton(AF_INET, PUDP_CFG_MC_ADDR, &mc_addr.sin_addr);
+
+    // Bind na porta
     struct sockaddr_in a = {
         .sin_family      = AF_INET,
         .sin_port        = htons(port),
         .sin_addr.s_addr = htonl(INADDR_ANY)
     };
     if (bind(udp_sock, (struct sockaddr*)&a, sizeof a) < 0) return -1;
+
     pthread_t th;
     pthread_create(&th, NULL, retrans_loop, NULL);
     pthread_detach(th);
@@ -273,6 +310,9 @@ static void update_all_peers_seq(uint32_t seq) {
         }
     }
     pthread_mutex_unlock(&seq_mtx);
+    
+    // Envia sync por multicast para atualizar todos os clientes
+    broadcast_sync(seq);
 }
 
 int receive_message(void *buf, int buflen) {
