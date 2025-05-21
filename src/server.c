@@ -18,17 +18,23 @@ static struct sockaddr_in mc_dst;
 /* Envia ConfigMessage em multicast para DATA_PORT (6001) */
 static void multicast_config(uint16_t to_ms, uint8_t max_rtx)
 {
-    char frame[sizeof(PUDPHeader) + sizeof(ConfigMessage)];
-    PUDPHeader *h = (PUDPHeader *)frame;
-    h->seq   = htonl(0);
-    h->flags = PUDP_F_CFG;
+    // Envia a mensagem várias vezes para garantir que todos os clientes recebam
+    for (int i = 0; i < 3; i++) {
+        char frame[sizeof(PUDPHeader) + sizeof(ConfigMessage)];
+        PUDPHeader *h = (PUDPHeader *)frame;
+        h->seq   = htonl(0);
+        h->flags = PUDP_F_CFG;
 
-    ConfigMessage *c = (ConfigMessage *)(frame + sizeof(PUDPHeader));
-    c->base_timeout_ms = (uint32_t)to_ms;
-    c->max_retries     = max_rtx;
+        ConfigMessage *c = (ConfigMessage *)(frame + sizeof(PUDPHeader));
+        c->base_timeout_ms = (uint32_t)to_ms;
+        c->max_retries     = max_rtx;
 
-    sendto(mc_sock, frame, sizeof frame, 0,
-           (struct sockaddr *)&mc_dst, sizeof mc_dst);
+        sendto(mc_sock, frame, sizeof frame, 0,
+               (struct sockaddr *)&mc_dst, sizeof mc_dst);
+
+        // Pequeno delay entre retransmissões
+        usleep(100000);  // 100ms
+    }
 
     printf("[SRV] Multicast CFG  timeout=%u  max_retries=%u\n",
            to_ms, max_rtx);
