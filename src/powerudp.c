@@ -219,12 +219,14 @@ static void add_pending(uint32_t seq, const char *frame, int len,
 static void ack_pending(uint32_t seq) {
     for (int i = 0; i < MAX_PENDING; ++i) {
         if (pend[i].in_use && pend[i].seq == seq) {
-            pend[i].in_use    = 0;
-            last_evt_status   = 1;
-            last_evt_seq      = seq;
+            pend[i].in_use = 0;
+            last_evt_status = 1;
+            last_evt_seq = seq;
+            fprintf(stderr, "[PUDP] ACK received for seq=%u\n", seq);
             return;
         }
     }
+    fprintf(stderr, "[PUDP] ACK for unknown seq=%u\n", seq);
 }
 
 /* common UDP socket initialization */
@@ -274,6 +276,7 @@ int send_message(const char *dest_ip, const void *buf, int len) {
     
     // Se houver muitas mensagens pendentes, espera um pouco
     if (pending_count > MAX_PENDING/2) {
+        fprintf(stderr, "[PUDP] High pending count (%d), adding delay\n", pending_count);
         pthread_mutex_unlock(&pend_mtx);
         msleep(5);  // 5ms delay
         pthread_mutex_lock(&pend_mtx);
@@ -296,16 +299,27 @@ int send_message(const char *dest_ip, const void *buf, int len) {
         return -1;
     }
 
+    fprintf(stderr, "[PUDP] Sending seq=%u to %s (pending=%d)\n", 
+            ntohl(h->seq), dest_ip, pending_count);
+
     add_pending(ntohl(h->seq), frame, flen, &dst);
     pthread_mutex_unlock(&pend_mtx);
 
     if (drop_probability && (rand() % 100) < drop_probability) {
-        fprintf(stderr, "[PUDP]  **SIM DROP %d%%**\n", drop_probability);
+        fprintf(stderr, "[PUDP] **SIM DROP %d%%**\n", drop_probability);
         return len;
     }
+
+    int sent = sendto(udp_sock, frame, flen, 0,
+                     (struct sockaddr*)&dst, sizeof dst);
     
-    return sendto(udp_sock, frame, flen, 0,
-                  (struct sockaddr*)&dst, sizeof dst) == flen ? len : -1;
+    if (sent != flen) {
+        fprintf(stderr, "[PUDP] Send error to %s: %s\n", 
+                dest_ip, strerror(errno));
+        return -1;
+    }
+    
+    return len;
 }
 
 int receive_message(void *buf, int buflen) {
@@ -322,6 +336,12 @@ int receive_message(void *buf, int buflen) {
     // Obtém a sequência esperada para este peer
     uint32_t peer_expected_seq = get_peer_seq(src.sin_addr);
 
+    char src_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &src.sin_addr, src_ip, sizeof(src_ip));
+
+    fprintf(stderr, "[PUDP] Received seq=%u from %s (expected=%u)\n",
+            h->seq, src_ip, peer_expected_seq);
+
     if (h->flags & PUDP_F_ACK) {
         pthread_mutex_lock(&pend_mtx);
         ack_pending(h->seq);
@@ -331,6 +351,8 @@ int receive_message(void *buf, int buflen) {
     }
 
     if (h->flags & PUDP_F_NAK) {
+        fprintf(stderr, "[PUDP] NAK received from %s for seq=%u\n",
+                src_ip, h->seq);
         resend_now(h->seq);
         return 0;
     }
@@ -347,8 +369,16 @@ int receive_message(void *buf, int buflen) {
             uint32_t next_seq = ntohl(sync->next_seq);
             update_peer_seq(src.sin_addr, next_seq);
             fprintf(stderr, "[PUDP] Resync from %s: expected_seq updated to %u\n",
-                    inet_ntoa(src.sin_addr), next_seq);
+                    src_ip, next_seq);
         }
+        return 0;
+    }
+
+    // Se a diferença de sequência for muito grande, pede ressincronização
+    if (h->seq > peer_expected_seq && h->seq - peer_expected_seq > MAX_SEQ_GAP) {
+        fprintf(stderr, "[PUDP] Large sequence gap from %s (%u -> %u), requesting resync\n",
+                src_ip, peer_expected_seq, h->seq);
+        send_sync_message(&src, peer_expected_seq, h->seq);
         return 0;
     }
 
@@ -359,6 +389,8 @@ int receive_message(void *buf, int buflen) {
         sendto(udp_sock, &ack, sizeof ack, 0,
                (struct sockaddr*)&src, sizeof src);
 
+        fprintf(stderr, "[PUDP] Processing seq=%u from %s\n", h->seq, src_ip);
+
         int dlen = n - (int)sizeof(*h);
         if (dlen > buflen) dlen = buflen;
         if (buf) memcpy(buf, frame + sizeof(*h), dlen);
@@ -366,11 +398,15 @@ int receive_message(void *buf, int buflen) {
         msleep(1);
         return dlen;
     } else if (h->seq < peer_expected_seq) {
+        fprintf(stderr, "[PUDP] Duplicate/old seq=%u from %s (expected=%u)\n",
+                h->seq, src_ip, peer_expected_seq);
         PUDPHeader ack = { htonl(h->seq), PUDP_F_ACK, {0} };
         sendto(udp_sock, &ack, sizeof ack, 0,
                (struct sockaddr*)&src, sizeof src);
         return 0;
     } else {
+        fprintf(stderr, "[PUDP] Future seq=%u from %s (expected=%u), sending NACK\n",
+                h->seq, src_ip, peer_expected_seq);
         PUDPHeader nack = { htonl(peer_expected_seq), PUDP_F_NAK, {0} };
         sendto(udp_sock, &nack, sizeof nack, 0,
                (struct sockaddr*)&src, sizeof src);
