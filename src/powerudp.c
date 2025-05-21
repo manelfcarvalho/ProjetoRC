@@ -38,17 +38,7 @@ static uint32_t        global_seq       = 1;  // Sequência global compartilhada
 int udp_sock = -1;
 
 /* sequencing & timeouts */
-static pthread_mutex_t  tx_seq_mtx      = PTHREAD_MUTEX_INITIALIZER;
-
-typedef struct {
-    struct in_addr addr;
-    uint32_t      tx_seq;
-    int           in_use;
-} PeerTxSeq;
-
-static PeerTxSeq tx_seqs[MAX_PEERS];
-
-static uint32_t seq_tx          = 1;
+static pthread_mutex_t  seq_mtx         = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t base_timeout_ms = PUDP_BASE_TO_MS;
 static uint8_t  max_retries     = PUDP_MAX_RETRY;
 static int      drop_probability= 0;
@@ -80,7 +70,6 @@ static int common_udp_init(uint16_t port);
 static void *retrans_loop(void *arg);
 static void apply_config(const ConfigMessage *cfg);
 static int resend_now(uint32_t seq);
-static uint32_t get_tx_seq(struct in_addr addr);
 static uint32_t get_next_seq(void);
 
 /* Implementações das funções */
@@ -241,31 +230,6 @@ static int resend_now(uint32_t seq) {
     return -1;
 }
 
-static uint32_t get_tx_seq(struct in_addr addr) {
-    pthread_mutex_lock(&tx_seq_mtx);
-    for (int i = 0; i < MAX_PEERS; i++) {
-        if (tx_seqs[i].in_use && 
-            tx_seqs[i].addr.s_addr == addr.s_addr) {
-            uint32_t seq = tx_seqs[i].tx_seq++;
-            pthread_mutex_unlock(&tx_seq_mtx);
-            return seq;
-        }
-    }
-    
-    // New peer, find free slot
-    for (int i = 0; i < MAX_PEERS; i++) {
-        if (!tx_seqs[i].in_use) {
-            tx_seqs[i].addr = addr;
-            tx_seqs[i].tx_seq = 2;  // Start with 1
-            tx_seqs[i].in_use = 1;
-            pthread_mutex_unlock(&tx_seq_mtx);
-            return 1;
-        }
-    }
-    pthread_mutex_unlock(&tx_seq_mtx);
-    return 1;
-}
-
 static int common_udp_init(uint16_t port) {
     // Inicializa estruturas
     memset(peer_states, 0, sizeof(peer_states));
@@ -299,7 +263,7 @@ static void *retrans_loop(void *arg) {
                 fprintf(stderr,
                     "[PUDP] seq %u DROPPED after %d tries\n",
                     pend[i].seq, pend[i].retries);
-                send_sync_message(&pend[i].dst, pend[i].seq, seq_tx);
+                send_sync_message(&pend[i].dst, pend[i].seq, global_seq);
                 last_evt_status = -1;
                 last_evt_seq = pend[i].seq;
                 pend[i].in_use = 0;
