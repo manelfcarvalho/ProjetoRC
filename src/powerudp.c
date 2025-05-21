@@ -55,7 +55,28 @@ typedef struct {
 
 static PeerSeq peer_seqs[MAX_PEERS];
 
-/* Função auxiliar para sleep em milissegundos */
+/* Declarações antecipadas de funções */
+static uint32_t now_ms(void);
+static void msleep(unsigned int ms);
+static void send_ack(const struct sockaddr_in *dst, uint32_t seq);
+static void send_nak(const struct sockaddr_in *dst, uint32_t expected_seq);
+static void send_sync_message(const struct sockaddr_in *dst, uint32_t last_seq, uint32_t next_seq);
+static uint32_t get_peer_seq(struct in_addr addr);
+static void update_peer_seq(struct in_addr addr, uint32_t new_seq);
+static void add_pending(uint32_t seq, const char *frame, int len, const struct sockaddr_in *dst);
+static void ack_pending(uint32_t seq);
+static int common_udp_init(uint16_t port);
+static void *retrans_loop(void *arg);
+static void apply_config(const ConfigMessage *cfg);
+static int resend_now(uint32_t seq);
+
+/* Implementações das funções */
+static uint32_t now_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
 static void msleep(unsigned int ms) {
     struct timespec ts = {
         .tv_sec = ms / 1000,
@@ -64,33 +85,37 @@ static void msleep(unsigned int ms) {
     nanosleep(&ts, NULL);
 }
 
-/* apply received ConfigMessage */
-static void apply_config(const ConfigMessage *cfg) {
-    base_timeout_ms = cfg->base_timeout_ms;
-    max_retries     = cfg->max_retries;
-    fprintf(stderr, "[PUDP] NEW CONFIG  timeout=%u ms  max_rtx=%u\n",
-           base_timeout_ms, max_retries);
+static void send_ack(const struct sockaddr_in *dst, uint32_t seq) {
+    PUDPHeader ack = { htonl(seq), PUDP_F_ACK, {0} };
+    sendto(udp_sock, &ack, sizeof ack, 0,
+           (struct sockaddr*)dst, sizeof(*dst));
+    fprintf(stderr, "[PUDP] Sent ACK for seq=%u\n", seq);
 }
 
-/* instant retransmission on NAK */
-static int resend_now(uint32_t seq) {
-    pthread_mutex_lock(&pend_mtx);
-    for (int i = 0; i < MAX_PENDING; ++i) {
-        if (pend[i].in_use && pend[i].seq == seq) {
-            sendto(udp_sock, pend[i].data, pend[i].len, 0,
-                   (struct sockaddr*)&pend[i].dst, sizeof pend[i].dst);
-            gettimeofday(&pend[i].ts, NULL);
-            fprintf(stderr,
-                "[PUDP] NACK → instant retrans seq=%u\n", seq);
-            pthread_mutex_unlock(&pend_mtx);
-            return 0;
-        }
-    }
-    pthread_mutex_unlock(&pend_mtx);
-    return -1;
+static void send_nak(const struct sockaddr_in *dst, uint32_t expected_seq) {
+    PUDPHeader nack = { htonl(expected_seq), PUDP_F_NAK, {0} };
+    sendto(udp_sock, &nack, sizeof nack, 0,
+           (struct sockaddr*)dst, sizeof(*dst));
+    fprintf(stderr, "[PUDP] Sent NAK, expecting seq=%u\n", expected_seq);
 }
 
-/* Inicializa ou obtém sequência esperada para um peer */
+static void send_sync_message(const struct sockaddr_in *dst, uint32_t last_seq, uint32_t next_seq) {
+    char frame[sizeof(PUDPHeader) + sizeof(SyncMessage)];
+    PUDPHeader *h = (PUDPHeader*)frame;
+    h->seq = htonl(next_seq);
+    h->flags = PUDP_F_SYNC;
+    
+    SyncMessage *sync = (SyncMessage*)(frame + sizeof(PUDPHeader));
+    sync->last_seq = htonl(last_seq);
+    sync->next_seq = htonl(next_seq);
+    
+    sendto(udp_sock, frame, sizeof(frame), 0,
+           (struct sockaddr*)dst, sizeof(*dst));
+    
+    fprintf(stderr, "[PUDP] Sent SYNC message (last=%u, next=%u)\n", 
+            last_seq, next_seq);
+}
+
 static uint32_t get_peer_seq(struct in_addr addr) {
     pthread_mutex_lock(&seq_mtx);
     for (int i = 0; i < MAX_PEERS; i++) {
@@ -116,7 +141,6 @@ static uint32_t get_peer_seq(struct in_addr addr) {
     return 1;
 }
 
-/* Atualiza sequência esperada para um peer */
 static void update_peer_seq(struct in_addr addr, uint32_t new_seq) {
     pthread_mutex_lock(&seq_mtx);
     for (int i = 0; i < MAX_PEERS; i++) {
@@ -130,32 +154,78 @@ static void update_peer_seq(struct in_addr addr, uint32_t new_seq) {
     pthread_mutex_unlock(&seq_mtx);
 }
 
-/* Função para enviar mensagem de sincronização */
-static void send_sync_message(const struct sockaddr_in *dst, uint32_t last_seq, uint32_t next_seq) {
-    char frame[sizeof(PUDPHeader) + sizeof(SyncMessage)];
-    PUDPHeader *h = (PUDPHeader*)frame;
-    h->seq = htonl(next_seq);
-    h->flags = PUDP_F_SYNC;
-    
-    SyncMessage *sync = (SyncMessage*)(frame + sizeof(PUDPHeader));
-    sync->last_seq = htonl(last_seq);
-    sync->next_seq = htonl(next_seq);
-    
-    sendto(udp_sock, frame, sizeof(frame), 0,
-           (struct sockaddr*)dst, sizeof(*dst));
-    
-    fprintf(stderr, "[PUDP] Sent SYNC message (last=%u, next=%u)\n", 
-            last_seq, next_seq);
+static void add_pending(uint32_t seq, const char *frame, int len,
+                       const struct sockaddr_in *dst) {
+    pthread_mutex_lock(&pend_mtx);
+    for (int i = 0; i < MAX_PENDING; ++i) {
+        if (!pend[i].in_use) {
+            pend[i].seq     = seq;
+            pend[i].len     = len;
+            memcpy(pend[i].data, frame, len);
+            pend[i].dst     = *dst;
+            gettimeofday(&pend[i].ts, NULL);
+            pend[i].to_ms   = base_timeout_ms;
+            pend[i].retries = 0;
+            pend[i].in_use  = 1;
+            pthread_mutex_unlock(&pend_mtx);
+            return;
+        }
+    }
+    pthread_mutex_unlock(&pend_mtx);
 }
 
-/* get current time in milliseconds */
-static uint32_t now_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec * 1000 + tv.tv_usec / 1000;
+static void ack_pending(uint32_t seq) {
+    for (int i = 0; i < MAX_PENDING; ++i) {
+        if (pend[i].in_use && pend[i].seq == seq) {
+            pend[i].in_use = 0;
+            last_evt_status = 1;
+            last_evt_seq = seq;
+            fprintf(stderr, "[PUDP] ACK received for seq=%u\n", seq);
+            return;
+        }
+    }
+    fprintf(stderr, "[PUDP] ACK for unknown seq=%u\n", seq);
 }
 
-/* retransmission loop thread */
+static void apply_config(const ConfigMessage *cfg) {
+    base_timeout_ms = cfg->base_timeout_ms;
+    max_retries     = cfg->max_retries;
+    fprintf(stderr, "[PUDP] NEW CONFIG  timeout=%u ms  max_rtx=%u\n",
+           base_timeout_ms, max_retries);
+}
+
+static int resend_now(uint32_t seq) {
+    pthread_mutex_lock(&pend_mtx);
+    for (int i = 0; i < MAX_PENDING; ++i) {
+        if (pend[i].in_use && pend[i].seq == seq) {
+            sendto(udp_sock, pend[i].data, pend[i].len, 0,
+                   (struct sockaddr*)&pend[i].dst, sizeof pend[i].dst);
+            gettimeofday(&pend[i].ts, NULL);
+            fprintf(stderr,
+                "[PUDP] NACK → instant retrans seq=%u\n", seq);
+            pthread_mutex_unlock(&pend_mtx);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&pend_mtx);
+    return -1;
+}
+
+static int common_udp_init(uint16_t port) {
+    udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_sock < 0) return -1;
+    struct sockaddr_in a = {
+        .sin_family      = AF_INET,
+        .sin_port        = htons(port),
+        .sin_addr.s_addr = htonl(INADDR_ANY)
+    };
+    if (bind(udp_sock, (struct sockaddr*)&a, sizeof a) < 0) return -1;
+    pthread_t th;
+    pthread_create(&th, NULL, retrans_loop, NULL);
+    pthread_detach(th);
+    return 0;
+}
+
 static void *retrans_loop(void *arg) {
     (void)arg;
     while (1) {
@@ -170,17 +240,13 @@ static void *retrans_loop(void *arg) {
                 fprintf(stderr,
                     "[PUDP] seq %u DROPPED after %d tries\n",
                     pend[i].seq, pend[i].retries);
-                    
-                /* Envia mensagem de sincronização */
                 send_sync_message(&pend[i].dst, pend[i].seq, seq_tx);
-                
                 last_evt_status = -1;
-                last_evt_seq    = pend[i].seq;
-                pend[i].in_use  = 0;
+                last_evt_seq = pend[i].seq;
+                pend[i].in_use = 0;
                 continue;
             }
 
-            /* retransmit */
             sendto(udp_sock, pend[i].data, pend[i].len, 0,
                    (struct sockaddr*)&pend[i].dst, sizeof pend[i].dst);
             gettimeofday(&pend[i].ts, NULL);
@@ -195,22 +261,6 @@ static void *retrans_loop(void *arg) {
         nanosleep(&ts, NULL);
     }
     return NULL;
-}
-
-/* Função para enviar ACK */
-static void send_ack(const struct sockaddr_in *dst, uint32_t seq) {
-    PUDPHeader ack = { htonl(seq), PUDP_F_ACK, {0} };
-    sendto(udp_sock, &ack, sizeof ack, 0,
-           (struct sockaddr*)dst, sizeof(*dst));
-    fprintf(stderr, "[PUDP] Sent ACK for seq=%u\n", seq);
-}
-
-/* Função para enviar NAK */
-static void send_nak(const struct sockaddr_in *dst, uint32_t expected_seq) {
-    PUDPHeader nack = { htonl(expected_seq), PUDP_F_NAK, {0} };
-    sendto(udp_sock, &nack, sizeof nack, 0,
-           (struct sockaddr*)dst, sizeof(*dst));
-    fprintf(stderr, "[PUDP] Sent NAK, expecting seq=%u\n", expected_seq);
 }
 
 int receive_message(void *buf, int buflen) {
@@ -308,39 +358,6 @@ int receive_message(void *buf, int buflen) {
     }
 }
 
-static void add_pending(uint32_t seq, const char *frame, int len,
-                       const struct sockaddr_in *dst) {
-    pthread_mutex_lock(&pend_mtx);
-    for (int i = 0; i < MAX_PENDING; ++i) {
-        if (!pend[i].in_use) {
-            pend[i].seq     = seq;
-            pend[i].len     = len;
-            memcpy(pend[i].data, frame, len);
-            pend[i].dst     = *dst;
-            gettimeofday(&pend[i].ts, NULL);
-            pend[i].to_ms   = base_timeout_ms;
-            pend[i].retries = 0;
-            pend[i].in_use  = 1;
-            pthread_mutex_unlock(&pend_mtx);
-            return;
-        }
-    }
-    pthread_mutex_unlock(&pend_mtx);
-}
-
-static void ack_pending(uint32_t seq) {
-    for (int i = 0; i < MAX_PENDING; ++i) {
-        if (pend[i].in_use && pend[i].seq == seq) {
-            pend[i].in_use = 0;
-            last_evt_status = 1;
-            last_evt_seq = seq;
-            fprintf(stderr, "[PUDP] ACK received for seq=%u\n", seq);
-            return;
-        }
-    }
-    fprintf(stderr, "[PUDP] ACK for unknown seq=%u\n", seq);
-}
-
 int send_message(const char *dest_ip, const void *buf, int len) {
     if (len > MAX_PAYLOAD) { errno = EINVAL; return -1; }
     
@@ -413,20 +430,4 @@ int powerudp_last_event(uint32_t *seq, int *status) {
     *status = last_evt_status;
     last_evt_status = 0;
     return 1;
-}
-
-/* common UDP socket initialization */
-static int common_udp_init(uint16_t port) {
-    udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (udp_sock < 0) return -1;
-    struct sockaddr_in a = {
-        .sin_family      = AF_INET,
-        .sin_port        = htons(port),
-        .sin_addr.s_addr = htonl(INADDR_ANY)
-    };
-    if (bind(udp_sock, (struct sockaddr*)&a, sizeof a) < 0) return -1;
-    pthread_t th;
-    pthread_create(&th, NULL, retrans_loop, NULL);
-    pthread_detach(th);
-    return 0;
 }
