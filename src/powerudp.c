@@ -333,11 +333,11 @@ int receive_message(void *buf, int buflen) {
     PUDPHeader *h = (PUDPHeader*)frame;
     h->seq = ntohl(h->seq);
 
-    // Obtém a sequência esperada para este peer
-    uint32_t peer_expected_seq = get_peer_seq(src.sin_addr);
-
     char src_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &src.sin_addr, src_ip, sizeof(src_ip));
+
+    // Obtém a sequência esperada para este peer
+    uint32_t peer_expected_seq = get_peer_seq(src.sin_addr);
 
     fprintf(stderr, "[PUDP] Received seq=%u from %s (expected=%u)\n",
             h->seq, src_ip, peer_expected_seq);
@@ -353,6 +353,11 @@ int receive_message(void *buf, int buflen) {
     if (h->flags & PUDP_F_NAK) {
         fprintf(stderr, "[PUDP] NAK received from %s for seq=%u\n",
                 src_ip, h->seq);
+        // O NAK contém a sequência que o peer espera receber
+        if (h->seq > peer_expected_seq) {
+            // Se o peer está esperando uma sequência maior, nos atualizamos
+            update_peer_seq(src.sin_addr, h->seq);
+        }
         resend_now(h->seq);
         return 0;
     }
@@ -370,6 +375,11 @@ int receive_message(void *buf, int buflen) {
             update_peer_seq(src.sin_addr, next_seq);
             fprintf(stderr, "[PUDP] Resync from %s: expected_seq updated to %u\n",
                     src_ip, next_seq);
+            
+            // Envia ACK para confirmar a sincronização
+            PUDPHeader ack = { htonl(h->seq), PUDP_F_ACK, {0} };
+            sendto(udp_sock, &ack, sizeof ack, 0,
+                   (struct sockaddr*)&src, sizeof src);
         }
         return 0;
     }
@@ -379,10 +389,14 @@ int receive_message(void *buf, int buflen) {
         fprintf(stderr, "[PUDP] Large sequence gap from %s (%u -> %u), requesting resync\n",
                 src_ip, peer_expected_seq, h->seq);
         send_sync_message(&src, peer_expected_seq, h->seq);
+        
+        // Atualiza nossa sequência esperada
+        update_peer_seq(src.sin_addr, h->seq);
         return 0;
     }
 
     if (h->seq == peer_expected_seq) {
+        // Processa a mensagem atual
         update_peer_seq(src.sin_addr, peer_expected_seq + 1);
         
         PUDPHeader ack = { htonl(h->seq), PUDP_F_ACK, {0} };
@@ -398,19 +412,39 @@ int receive_message(void *buf, int buflen) {
         msleep(1);
         return dlen;
     } else if (h->seq < peer_expected_seq) {
-        fprintf(stderr, "[PUDP] Duplicate/old seq=%u from %s (expected=%u)\n",
+        // Mensagem antiga ou duplicada, reenvia ACK
+        fprintf(stderr, "[PUDP] Duplicate/old seq=%u from %s (expected=%u), sending ACK\n",
                 h->seq, src_ip, peer_expected_seq);
         PUDPHeader ack = { htonl(h->seq), PUDP_F_ACK, {0} };
         sendto(udp_sock, &ack, sizeof ack, 0,
                (struct sockaddr*)&src, sizeof src);
         return 0;
     } else {
-        fprintf(stderr, "[PUDP] Future seq=%u from %s (expected=%u), sending NACK\n",
-                h->seq, src_ip, peer_expected_seq);
-        PUDPHeader nack = { htonl(peer_expected_seq), PUDP_F_NAK, {0} };
-        sendto(udp_sock, &nack, sizeof nack, 0,
-               (struct sockaddr*)&src, sizeof src);
-        return 0;
+        // Sequência futura, verifica se é próxima
+        if (h->seq == peer_expected_seq + 1) {
+            // É a próxima sequência, podemos aceitar
+            fprintf(stderr, "[PUDP] Accepting next seq=%u from %s\n", h->seq, src_ip);
+            update_peer_seq(src.sin_addr, h->seq + 1);
+            
+            PUDPHeader ack = { htonl(h->seq), PUDP_F_ACK, {0} };
+            sendto(udp_sock, &ack, sizeof ack, 0,
+                   (struct sockaddr*)&src, sizeof src);
+
+            int dlen = n - (int)sizeof(*h);
+            if (dlen > buflen) dlen = buflen;
+            if (buf) memcpy(buf, frame + sizeof(*h), dlen);
+            
+            msleep(1);
+            return dlen;
+        } else {
+            // Sequência muito à frente, envia NACK
+            fprintf(stderr, "[PUDP] Future seq=%u from %s (expected=%u), sending NACK\n",
+                    h->seq, src_ip, peer_expected_seq);
+            PUDPHeader nack = { htonl(peer_expected_seq), PUDP_F_NAK, {0} };
+            sendto(udp_sock, &nack, sizeof nack, 0,
+                   (struct sockaddr*)&src, sizeof src);
+            return 0;
+        }
     }
 }
 
