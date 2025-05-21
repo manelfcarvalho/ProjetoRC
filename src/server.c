@@ -19,6 +19,13 @@ static struct sockaddr_in mc_dst;
 /* Envia ConfigMessage em multicast para DATA_PORT (6001) */
 static void multicast_config(uint16_t to_ms, uint8_t max_rtx)
 {
+    // Configura TTL para permitir que as mensagens alcancem todos os clientes
+    int ttl = 5;
+    if (setsockopt(mc_sock, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl)) < 0) {
+        perror("IP_MULTICAST_TTL");
+        return;
+    }
+
     // Envia a mensagem várias vezes para garantir que todos os clientes recebam
     for (int i = 0; i < 3; i++) {
         char frame[sizeof(PUDPHeader) + sizeof(ConfigMessage)];
@@ -30,8 +37,15 @@ static void multicast_config(uint16_t to_ms, uint8_t max_rtx)
         c->base_timeout_ms = (uint32_t)to_ms;
         c->max_retries     = max_rtx;
 
-        sendto(mc_sock, frame, sizeof frame, 0,
-               (struct sockaddr *)&mc_dst, sizeof mc_dst);
+        // Envia para o endereço multicast
+        if (sendto(mc_sock, frame, sizeof frame, 0,
+                   (struct sockaddr *)&mc_dst, sizeof mc_dst) < 0) {
+            perror("sendto multicast");
+            continue;
+        }
+
+        printf("[SRV] Sent config (try %d/3): timeout=%u ms, retries=%u\n",
+               i+1, to_ms, max_rtx);
 
         // Pequeno delay entre retransmissões
         struct timespec ts = {
@@ -40,9 +54,6 @@ static void multicast_config(uint16_t to_ms, uint8_t max_rtx)
         };
         nanosleep(&ts, NULL);
     }
-
-    printf("[SRV] Multicast CFG  timeout=%u  max_retries=%u\n",
-           to_ms, max_rtx);
 }
 
 /* Thread por cliente TCP */
@@ -85,38 +96,71 @@ int main(int argc, char **argv)
 
     /* 1) Socket multicast sobre o DATA_PORT */
     mc_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    int ttl = 5;  /* Aumentado para permitir mais hops */
-    setsockopt(mc_sock, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof ttl);
-    mc_dst.sin_family = AF_INET;
-    mc_dst.sin_port   = htons(PUDP_DATA_PORT);            /* 6001 */
-    inet_pton(AF_INET, PUDP_CFG_MC_ADDR, &mc_dst.sin_addr);
-
-    /* 2) TCP listen para registo */
-    tcp_sock = socket(AF_INET, SOCK_STREAM, 0);
-    int yes = 1;
-    setsockopt(tcp_sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
-
-    struct sockaddr_in s = { .sin_family = AF_INET,
-                             .sin_addr.s_addr = htonl(INADDR_ANY),
-                             .sin_port        = htons(port) };
-    if (bind(tcp_sock, (struct sockaddr *)&s, sizeof s) < 0 ||
-        listen(tcp_sock, MAX_TCP_QUEUE) < 0) {
-        perror("TCP bind/listen");
+    if (mc_sock < 0) {
+        perror("socket multicast");
         return 1;
     }
 
-    printf("[SRV] TCP %d  UDP %d ready\n", port, PUDP_DATA_PORT);
+    // Permite reutilização do endereço
+    int yes = 1;
+    if (setsockopt(mc_sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) {
+        perror("SO_REUSEADDR");
+        return 1;
+    }
+
+    // Configura endereço multicast
+    mc_dst.sin_family = AF_INET;
+    mc_dst.sin_port   = htons(PUDP_DATA_PORT);
+    if (inet_pton(AF_INET, PUDP_CFG_MC_ADDR, &mc_dst.sin_addr) != 1) {
+        perror("inet_pton");
+        return 1;
+    }
+
+    /* 2) TCP listen para registo */
+    tcp_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (tcp_sock < 0) {
+        perror("socket tcp");
+        return 1;
+    }
+
+    if (setsockopt(tcp_sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes) < 0) {
+        perror("SO_REUSEADDR tcp");
+        return 1;
+    }
+
+    struct sockaddr_in s = { 
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+        .sin_port = htons(port) 
+    };
+
+    if (bind(tcp_sock, (struct sockaddr *)&s, sizeof s) < 0) {
+        perror("bind");
+        return 1;
+    }
+
+    if (listen(tcp_sock, MAX_TCP_QUEUE) < 0) {
+        perror("listen");
+        return 1;
+    }
+
+    printf("[SRV] Ready - TCP port %d, Multicast group %s:%d\n", 
+           port, PUDP_CFG_MC_ADDR, PUDP_DATA_PORT);
 
     /* 3) Aceita clientes indefinidamente */
     while (1) {
-        struct sockaddr_in c; socklen_t cl = sizeof c;
+        struct sockaddr_in c; 
+        socklen_t cl = sizeof c;
         int *cs = malloc(sizeof(int));
         *cs = accept(tcp_sock, (struct sockaddr *)&c, &cl);
-        if (*cs < 0) { free(cs); continue; }
+        if (*cs < 0) { 
+            free(cs); 
+            continue; 
+        }
 
         char ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &c.sin_addr, ip, sizeof ip);
-        printf("[SRV] New TCP client %s:%d\n", ip, ntohs(c.sin_port));
+        printf("[SRV] New client %s:%d\n", ip, ntohs(c.sin_port));
 
         pthread_t th;
         pthread_create(&th, NULL, client_thr, cs);

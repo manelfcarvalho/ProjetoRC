@@ -19,27 +19,19 @@ extern int udp_sock;
 
 #define BUFSZ 512
 
-/* Join no grupo multicast para ConfigMessage, usando o IP local de eth0 */
+/* Join no grupo multicast para ConfigMessage */
 static void join_cfg_multicast(void) {
-    struct ifreq ifr = {0};
-    strncpy(ifr.ifr_name, "eth0", IFNAMSIZ);
-
-    // obtém o IP de eth0
-    if (ioctl(udp_sock, SIOCGIFADDR, &ifr) < 0) {
-        perror("SIOCGIFADDR");
-        exit(1);
-    }
-    struct in_addr local = ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr;
-
     struct ip_mreq mreq;
     inet_pton(AF_INET, PUDP_CFG_MC_ADDR, &mreq.imr_multiaddr);
-    mreq.imr_interface = local;
+    mreq.imr_interface.s_addr = htonl(INADDR_ANY);
 
     if (setsockopt(udp_sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
                    &mreq, sizeof mreq) < 0) {
         perror("IP_ADD_MEMBERSHIP");
         exit(1);
     }
+
+    printf("[CLI] Joined multicast group %s\n", PUDP_CFG_MC_ADDR);
 }
 
 /* Listener for UDP messages (ACK/NACK/CFG and peer payload) */
@@ -93,7 +85,6 @@ int main(int argc, char **argv) {
     /* opcional: simular perda de 30% nos pacotes enviados */
     // inject_packet_loss(30);
 
-
     /* 2) join multicast group for dynamic config */
     join_cfg_multicast();
 
@@ -119,7 +110,7 @@ int main(int argc, char **argv) {
 
         if (!strncmp(line, ":setcfg", 7)) {
             send(tcp, line, (int)len, 0);
-            printf("[CLI] pedido de nova config enviado\n> ");
+            printf("[CLI] Config request sent\n> ");
             continue;
         }
 
@@ -134,7 +125,7 @@ int main(int argc, char **argv) {
         if (send_message(dest, msg, (int)strlen(msg)) < 0)
             perror("send_message");
         else
-            printf("[CLI] sent seq to %s\n> ", dest);
+            printf("[CLI] Message sent to %s\n> ", dest);
     }
 
     close_protocol();
