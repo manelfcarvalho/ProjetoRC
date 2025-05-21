@@ -8,6 +8,8 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <time.h>
+#include <errno.h>
+#include <sys/time.h>
 
 #define MAX_TCP_QUEUE  8
 #define BUF_CMD       128
