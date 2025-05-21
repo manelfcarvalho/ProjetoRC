@@ -365,7 +365,6 @@ int receive_message(void *buf, int buflen) {
     if (h->flags & PUDP_F_SYNC) {
         if ((size_t)n >= sizeof(*h) + sizeof(SyncMessage)) {
             SyncMessage *sync = (SyncMessage*)(frame + sizeof(*h));
-            uint32_t next_seq = ntohl(sync->next_seq);
             uint32_t last_seq = ntohl(sync->last_seq);
             
             // Atualiza todos os peers exceto o remetente
