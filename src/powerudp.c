@@ -15,7 +15,7 @@
 
 #define MAX_PENDING 32
 #define MAX_PAYLOAD 512
-#define MAX_SEQ_GAP 100  /* Máxima diferença aceitável entre sequências */
+#define MAX_SEQ_GAP 100
 
 typedef struct {
     uint32_t            seq;
@@ -30,6 +30,7 @@ typedef struct {
 
 static Pending          pend[MAX_PENDING];
 static pthread_mutex_t  pend_mtx        = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t  seq_mtx         = PTHREAD_MUTEX_INITIALIZER;
 
 /* UDP socket for both client and server roles */
 int udp_sock = -1;
@@ -45,6 +46,16 @@ static int      drop_probability= 0;
 static int      last_evt_status = 0;  /* 1=ACK, -1=DROP */
 static uint32_t last_evt_seq    = 0;
 
+/* Mapa de sequências por IP */
+#define MAX_PEERS 256
+typedef struct {
+    struct in_addr addr;
+    uint32_t      expected_seq;
+    int           in_use;
+} PeerSeq;
+
+static PeerSeq peer_seqs[MAX_PEERS];
+
 /* Função auxiliar para sleep em milissegundos */
 static void msleep(unsigned int ms) {
     struct timespec ts = {
@@ -52,6 +63,46 @@ static void msleep(unsigned int ms) {
         .tv_nsec = (ms % 1000) * 1000000
     };
     nanosleep(&ts, NULL);
+}
+
+/* Inicializa ou obtém sequência esperada para um peer */
+static uint32_t get_peer_seq(struct in_addr addr) {
+    pthread_mutex_lock(&seq_mtx);
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (peer_seqs[i].in_use && 
+            peer_seqs[i].addr.s_addr == addr.s_addr) {
+            uint32_t seq = peer_seqs[i].expected_seq;
+            pthread_mutex_unlock(&seq_mtx);
+            return seq;
+        }
+    }
+    
+    // Novo peer, procura slot livre
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (!peer_seqs[i].in_use) {
+            peer_seqs[i].addr = addr;
+            peer_seqs[i].expected_seq = 1;
+            peer_seqs[i].in_use = 1;
+            pthread_mutex_unlock(&seq_mtx);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&seq_mtx);
+    return 1;
+}
+
+/* Atualiza sequência esperada para um peer */
+static void update_peer_seq(struct in_addr addr, uint32_t new_seq) {
+    pthread_mutex_lock(&seq_mtx);
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (peer_seqs[i].in_use && 
+            peer_seqs[i].addr.s_addr == addr.s_addr) {
+            peer_seqs[i].expected_seq = new_seq;
+            pthread_mutex_unlock(&seq_mtx);
+            return;
+        }
+    }
+    pthread_mutex_unlock(&seq_mtx);
 }
 
 /* Função para enviar mensagem de sincronização */
@@ -266,77 +317,48 @@ int receive_message(void *buf, int buflen) {
     PUDPHeader *h = (PUDPHeader*)frame;
     h->seq = ntohl(h->seq);
 
+    // Obtém a sequência esperada para este peer
+    uint32_t peer_expected_seq = get_peer_seq(src.sin_addr);
+
     if (h->flags & PUDP_F_ACK) {
         pthread_mutex_lock(&pend_mtx);
         ack_pending(h->seq);
         pthread_mutex_unlock(&pend_mtx);
-        
-        // Pequeno delay após ACK para permitir processamento
-        msleep(1);  // 1ms delay
+        msleep(1);
         return 0;
     }
-    if (h->flags & PUDP_F_NAK) {
-        resend_now(h->seq);
-        return 0;
-    }
-    if (h->flags & PUDP_F_CFG) {
-        if ((size_t)n >= sizeof(*h) + sizeof(ConfigMessage))
-            apply_config((ConfigMessage*)(frame + sizeof(*h)));
-        return 0;
-    }
+
     if (h->flags & PUDP_F_SYNC) {
         if ((size_t)n >= sizeof(*h) + sizeof(SyncMessage)) {
             SyncMessage *sync = (SyncMessage*)(frame + sizeof(*h));
-            uint32_t last_seq = ntohl(sync->last_seq);
             uint32_t next_seq = ntohl(sync->next_seq);
-            
-            if (expected_seq <= last_seq) {
-                expected_seq = next_seq;
-                fprintf(stderr, "[PUDP] Resync: expected_seq updated to %u\n", 
-                        expected_seq);
-            }
+            update_peer_seq(src.sin_addr, next_seq);
+            fprintf(stderr, "[PUDP] Resync from %s: expected_seq updated to %u\n",
+                    inet_ntoa(src.sin_addr), next_seq);
         }
         return 0;
     }
 
-    /* Verifica se a diferença entre sequências é muito grande */
-    if (h->seq > expected_seq && h->seq - expected_seq > MAX_SEQ_GAP) {
-        fprintf(stderr, "[PUDP] Large sequence gap detected (%u -> %u)\n",
-                expected_seq, h->seq);
-        /* Solicita ressincronização */
-        PUDPHeader sync_req = { htonl(expected_seq), PUDP_F_SYNC, {0} };
-        sendto(udp_sock, &sync_req, sizeof sync_req, 0,
-               (struct sockaddr*)&src, sizeof src);
-        return 0;
-    }
-
-    if (h->seq == expected_seq) {
-        // Processa a mensagem atual
-        expected_seq++;
+    if (h->seq == peer_expected_seq) {
+        update_peer_seq(src.sin_addr, peer_expected_seq + 1);
         
-        // Envia ACK
         PUDPHeader ack = { htonl(h->seq), PUDP_F_ACK, {0} };
         sendto(udp_sock, &ack, sizeof ack, 0,
                (struct sockaddr*)&src, sizeof src);
 
-        // Copia os dados
         int dlen = n - (int)sizeof(*h);
         if (dlen > buflen) dlen = buflen;
         if (buf) memcpy(buf, frame + sizeof(*h), dlen);
         
-        // Pequeno delay para processamento
-        msleep(1);  // 1ms delay
-        
+        msleep(1);
         return dlen;
-    } else if (h->seq < expected_seq) {
-        // Mensagem duplicada ou antiga, reenvia ACK
+    } else if (h->seq < peer_expected_seq) {
         PUDPHeader ack = { htonl(h->seq), PUDP_F_ACK, {0} };
         sendto(udp_sock, &ack, sizeof ack, 0,
                (struct sockaddr*)&src, sizeof src);
         return 0;
     } else {
-        // Sequência futura, envia NACK
-        PUDPHeader nack = { htonl(expected_seq), PUDP_F_NAK, {0} };
+        PUDPHeader nack = { htonl(peer_expected_seq), PUDP_F_NAK, {0} };
         sendto(udp_sock, &nack, sizeof nack, 0,
                (struct sockaddr*)&src, sizeof src);
         return 0;
