@@ -71,6 +71,7 @@ static void *retrans_loop(void *arg);
 static void apply_config(const ConfigMessage *cfg);
 static int resend_now(uint32_t seq);
 static uint32_t get_next_seq(void);
+static void update_all_peers_seq(uint32_t seq);
 
 /* Implementações das funções */
 static uint32_t now_ms(void) {
@@ -286,6 +287,18 @@ static void *retrans_loop(void *arg) {
     return NULL;
 }
 
+static void update_all_peers_seq(uint32_t seq) {
+    pthread_mutex_lock(&seq_mtx);
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (peer_states[i].in_use && peer_states[i].last_seen_seq < seq) {
+            peer_states[i].last_seen_seq = seq;
+            fprintf(stderr, "[PUDP] Updated peer %s to seq=%u\n",
+                    inet_ntoa(peer_states[i].addr), seq);
+        }
+    }
+    pthread_mutex_unlock(&seq_mtx);
+}
+
 int receive_message(void *buf, int buflen) {
     char frame[sizeof(PUDPHeader) + MAX_PAYLOAD];
     struct sockaddr_in src;
@@ -332,11 +345,11 @@ int receive_message(void *buf, int buflen) {
             SyncMessage *sync = (SyncMessage*)(frame + sizeof(*h));
             uint32_t next_seq = ntohl(sync->next_seq);
             
-            // Só atualiza se a nova sequência for maior
+            // Atualiza todos os peers para a nova sequência
             if (next_seq > peer_expected_seq) {
-                update_peer_seq(src.sin_addr, next_seq);
-                fprintf(stderr, "[PUDP] Resync from %s: expected_seq updated to %u\n",
-                        src_ip, next_seq);
+                update_all_peers_seq(next_seq - 1);
+                fprintf(stderr, "[PUDP] Resync from %s: all peers updated to seq=%u\n",
+                        src_ip, next_seq - 1);
             }
             
             // Confirma recebimento da mensagem de sync
@@ -354,8 +367,8 @@ int receive_message(void *buf, int buflen) {
     }
 
     if (h->seq == peer_expected_seq) {
-        // Processa a mensagem atual
-        update_peer_seq(src.sin_addr, peer_expected_seq + 1);
+        // Atualiza todos os peers quando uma mensagem é processada com sucesso
+        update_all_peers_seq(h->seq);
         send_ack(&src, h->seq);
 
         fprintf(stderr, "[PUDP] Processing seq=%u from %s\n", h->seq, src_ip);
