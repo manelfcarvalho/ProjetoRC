@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <time.h>
 
 #define MAX_TCP_QUEUE  8
 #define BUF_CMD       128
@@ -33,7 +34,11 @@ static void multicast_config(uint16_t to_ms, uint8_t max_rtx)
                (struct sockaddr *)&mc_dst, sizeof mc_dst);
 
         // Pequeno delay entre retransmissões
-        usleep(100000);  // 100ms
+        struct timespec ts = {
+            .tv_sec = 0,
+            .tv_nsec = 100000000  // 100ms
+        };
+        nanosleep(&ts, NULL);
     }
 
     printf("[SRV] Multicast CFG  timeout=%u  max_retries=%u\n",
