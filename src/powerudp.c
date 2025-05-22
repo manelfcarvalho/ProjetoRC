@@ -21,6 +21,61 @@
 #define MAX_PEERS 256
 
 typedef struct {
+    char client_id[32];
+    char ip[INET_ADDRSTRLEN];
+    time_t last_seen;
+    int in_use;
+} PeerInfo;
+
+static PeerInfo peers[PUDP_MAX_PEERS];
+static pthread_mutex_t peers_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Registra ou atualiza informações de um peer */
+void register_peer(const char *client_id, const char *ip) {
+    pthread_mutex_lock(&peers_mutex);
+    
+    // Procura se o peer já existe
+    for (int i = 0; i < PUDP_MAX_PEERS; i++) {
+        if (peers[i].in_use && strcmp(peers[i].client_id, client_id) == 0) {
+            // Atualiza IP e timestamp
+            strncpy(peers[i].ip, ip, INET_ADDRSTRLEN-1);
+            peers[i].last_seen = time(NULL);
+            pthread_mutex_unlock(&peers_mutex);
+            return;
+        }
+    }
+    
+    // Se não existe, procura slot livre
+    for (int i = 0; i < PUDP_MAX_PEERS; i++) {
+        if (!peers[i].in_use) {
+            strncpy(peers[i].client_id, client_id, sizeof(peers[i].client_id)-1);
+            strncpy(peers[i].ip, ip, INET_ADDRSTRLEN-1);
+            peers[i].last_seen = time(NULL);
+            peers[i].in_use = 1;
+            printf("[PUDP] Registered peer %s at %s\n", client_id, ip);
+            pthread_mutex_unlock(&peers_mutex);
+            return;
+        }
+    }
+    
+    pthread_mutex_unlock(&peers_mutex);
+}
+
+/* Procura o IP real de um peer pelo seu ID */
+static const char *find_peer_ip(const char *client_id) {
+    pthread_mutex_lock(&peers_mutex);
+    for (int i = 0; i < PUDP_MAX_PEERS; i++) {
+        if (peers[i].in_use && strcmp(peers[i].client_id, client_id) == 0) {
+            const char *ip = strdup(peers[i].ip);  // Aloca cópia para retornar
+            pthread_mutex_unlock(&peers_mutex);
+            return ip;
+        }
+    }
+    pthread_mutex_unlock(&peers_mutex);
+    return NULL;
+}
+
+typedef struct {
     uint32_t            seq;
     int                 len;
     char                data[sizeof(PUDPHeader) + MAX_PAYLOAD];
@@ -404,16 +459,29 @@ int receive_message(void *buf, int buflen) {
     }
 }
 
-int send_message(const char *dest_ip, const void *buf, int len) {
+int send_message(const char *dest_id, const void *buf, int len) {
     if (len > MAX_PAYLOAD) { errno = EINVAL; return -1; }
     
+    // Primeiro tenta interpretar como IP (para compatibilidade)
     struct sockaddr_in dst = {
         .sin_family = AF_INET,
         .sin_port   = htons(PUDP_DATA_PORT)
     };
-    if (inet_pton(AF_INET, dest_ip, &dst.sin_addr) != 1) {
-        errno = EINVAL;
-        return -1;
+    
+    if (inet_pton(AF_INET, dest_id, &dst.sin_addr) != 1) {
+        // Se não é IP, procura o peer pelo ID
+        const char *real_ip = find_peer_ip(dest_id);
+        if (!real_ip) {
+            printf("\n[PUDP] Unknown peer ID: %s\n> ", dest_id);
+            errno = EINVAL;
+            return -1;
+        }
+        if (inet_pton(AF_INET, real_ip, &dst.sin_addr) != 1) {
+            free((void*)real_ip);
+            errno = EINVAL;
+            return -1;
+        }
+        free((void*)real_ip);
     }
 
     char frame[sizeof(PUDPHeader) + MAX_PAYLOAD];

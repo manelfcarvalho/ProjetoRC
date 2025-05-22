@@ -19,6 +19,8 @@ extern int udp_sock;
 
 #define BUFSZ 512
 
+static char my_client_id[32];  // ID deste cliente
+
 /* Join no grupo multicast para ConfigMessage */
 static void join_cfg_multicast(void) {
     // Permite múltiplos sockets no mesmo endereço
@@ -89,12 +91,21 @@ static int tcp_register(const char *srv_ip, int port, const char *psk) {
     if (connect(s, (struct sockaddr *)&d, sizeof d) < 0) {
         perror("connect"); return -1;
     }
+
+    // Gera um ID único para este cliente usando o hostname
+    char hostname[32];
+    gethostname(hostname, sizeof(hostname));
+    snprintf(my_client_id, sizeof(my_client_id), "%s_%d", hostname, getpid());
+
     RegisterMessage r = {0};
     strncpy(r.psk, psk, sizeof r.psk - 1);
+    strncpy(r.client_id, my_client_id, sizeof r.client_id - 1);
+
     if (send(s, &r, sizeof r, 0) != sizeof r) {
         perror("send PSK"); close(s); return -1;
     }
-    printf("[CLI] Registered at %s:%d (PSK OK)\n", srv_ip, port);
+    printf("[CLI] Registered at %s:%d (PSK OK) with ID %s\n", 
+           srv_ip, port, my_client_id);
     return s;
 }
 
@@ -147,16 +158,18 @@ int main(int argc, char **argv) {
 
         char *space = strchr(line, ' ');
         if (!space) {
-            fprintf(stderr, "Invalid. Use '<peer_ip> <msg>' or ':setcfg'\n> ");
+            fprintf(stderr, "Invalid. Use '<peer_id> <msg>' or ':setcfg'\n> ");
             continue;
         }
         *space = '\0';
-        const char *dest = line;
+        const char *dest_id = line;
         const char *msg  = space + 1;
-        if (send_message(dest, msg, (int)strlen(msg)) < 0)
+
+        // Envia a mensagem usando o ID do peer
+        if (send_message(dest_id, msg, (int)strlen(msg)) < 0)
             perror("send_message");
         else
-            printf("[CLI] Message sent to %s\n> ", dest);
+            printf("[CLI] Message sent to peer %s\n> ", dest_id);
     }
 
     close_protocol();

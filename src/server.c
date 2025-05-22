@@ -54,6 +54,13 @@ static void *client_thr(void *arg)
     int csock = *(int *)arg; free(arg);
     char buf[BUF_CMD];
 
+    // Obtém o IP do cliente
+    struct sockaddr_in addr;
+    socklen_t addr_len = sizeof(addr);
+    getpeername(csock, (struct sockaddr*)&addr, &addr_len);
+    char client_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &addr.sin_addr, client_ip, sizeof(client_ip));
+
     RegisterMessage reg;
     if (recv(csock, &reg, sizeof reg, MSG_WAITALL) != sizeof reg) {
         close(csock); return NULL;
@@ -62,7 +69,10 @@ static void *client_thr(void *arg)
         printf("[SRV] Bad PSK – ligação fechada\n");
         close(csock); return NULL;
     }
-    printf("[SRV] PSK OK\n");
+
+    // Registra o peer com seu IP real
+    register_peer(reg.client_id, client_ip);
+    printf("[SRV] PSK OK - Client %s\n", reg.client_id);
 
     /* Loop :setcfg */
     while (1) {
