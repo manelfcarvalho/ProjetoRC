@@ -93,9 +93,16 @@ static int tcp_register(const char *srv_ip, int port, const char *psk) {
     }
 
     // Gera um ID único para este cliente usando o hostname
-    char hostname[32];
+    char hostname[16];  // Reduzido para garantir espaço para o PID
     gethostname(hostname, sizeof(hostname));
-    snprintf(my_client_id, sizeof(my_client_id), "%s_%d", hostname, getpid());
+    hostname[15] = '\0';  // Garante terminação
+    
+    // Limita o tamanho do hostname se necessário
+    char *dot = strchr(hostname, '.');
+    if (dot) *dot = '\0';  // Remove domínio se presente
+    
+    // Gera o ID com tamanho controlado
+    snprintf(my_client_id, sizeof(my_client_id), "%.20s_%d", hostname, (int)(getpid() % 10000));
 
     RegisterMessage r = {0};
     strncpy(r.psk, psk, sizeof r.psk - 1);
