@@ -65,42 +65,14 @@ static void join_cfg_multicast(void) {
 static void *udp_listener(void *arg) {
     (void)arg;
     char buf[BUFSZ];
-    struct sockaddr_in from;
-    socklen_t fromlen = sizeof(from);
-
     while (1) {
-        int n = recvfrom(udp_sock, buf, sizeof(buf), 0,
-                        (struct sockaddr *)&from, &fromlen);
+        int n = receive_message(buf, sizeof buf - 1);
         if (n <= 0) continue;
 
-        // Processa o header PowerUDP
-        if (n >= (int)sizeof(PUDPHeader)) {
-            PUDPHeader *h = (PUDPHeader *)buf;
-            
-            // Processa mensagem de configuração
-            if (h->flags & PUDP_F_CFG && n >= (int)(sizeof(PUDPHeader) + sizeof(ConfigMessage))) {
-                ConfigMessage *cfg = (ConfigMessage *)(buf + sizeof(PUDPHeader));
-                printf("\n[CLI] Received config: timeout=%u ms, retries=%u\n> ",
-                       cfg->base_timeout_ms, cfg->max_retries);
-                
-                // Envia ACK para a configuração
-                PUDPHeader ack = {
-                    .seq = h->seq,
-                    .flags = PUDP_F_ACK,
-                };
-                
-                if (sendto(udp_sock, &ack, sizeof(ack), 0,
-                          (struct sockaddr *)&from, fromlen) < 0) {
-                    perror("sendto ACK");
-                }
-                
-                fflush(stdout);
-                continue;
-            }
-        }
+        // Se for uma mensagem de configuração, será processada dentro do receive_message
+        // e não chegará aqui
 
-        // Processa mensagens normais
-        if (n < BUFSZ) buf[n] = '\0';
+        buf[n] = '\0';
         printf("\n[CLI] RX «%s»\n> ", buf);
         fflush(stdout);
     }
