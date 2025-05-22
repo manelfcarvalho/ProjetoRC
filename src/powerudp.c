@@ -159,7 +159,7 @@ static void add_pending(uint32_t seq, const char *frame, int len,
             memcpy(pend[i].data, frame, len);
             pend[i].dst     = *dst;
             gettimeofday(&pend[i].ts, NULL);
-            pend[i].to_ms   = base_timeout_ms;
+            pend[i].to_ms   = 100;  // Começa com 100ms de timeout
             pend[i].retries = 0;
             pend[i].in_use  = 1;
             pthread_mutex_unlock(&pend_mtx);
@@ -219,6 +219,7 @@ static void broadcast_sync(uint32_t seq) {
 static int common_udp_init(uint16_t port) {
     // Inicializa estruturas
     memset(peer_states, 0, sizeof(peer_states));
+    memset(pend, 0, sizeof(pend));  // Limpa estruturas pendentes
     global_seq = 1;
     
     // Configura socket UDP
@@ -229,6 +230,26 @@ static int common_udp_init(uint16_t port) {
     int yes = 1;
     if (setsockopt(udp_sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) {
         perror("SO_REUSEADDR");
+        return -1;
+    }
+
+    // Configura timeout de recepção para não bloquear indefinidamente
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 100000;  // 100ms
+    if (setsockopt(udp_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        perror("SO_RCVTIMEO");
+        return -1;
+    }
+
+    // Aumenta os buffers de envio e recepção
+    int bufsize = 262144;  // 256KB
+    if (setsockopt(udp_sock, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize)) < 0) {
+        perror("SO_RCVBUF");
+        return -1;
+    }
+    if (setsockopt(udp_sock, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize)) < 0) {
+        perror("SO_SNDBUF");
         return -1;
     }
 
@@ -266,7 +287,6 @@ static void *retrans_loop(void *arg) {
                 last_evt_status = -1;
                 last_evt_seq = pend[i].seq;
                 
-                // Adiciona log quando uma mensagem é descartada
                 char dst_ip[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, &pend[i].dst.sin_addr, dst_ip, sizeof(dst_ip));
                 printf("\n[PUDP] Message to %s dropped after %d retries\n> ", 
@@ -277,21 +297,23 @@ static void *retrans_loop(void *arg) {
                 continue;
             }
 
+            // Retransmite a mensagem
             sendto(udp_sock, pend[i].data, pend[i].len, 0,
                    (struct sockaddr*)&pend[i].dst, sizeof pend[i].dst);
             gettimeofday(&pend[i].ts, NULL);
             pend[i].retries++;
-            pend[i].to_ms *= 2;
+            pend[i].to_ms *= 2;  // Backoff exponencial
 
-            // Adiciona log de retransmissão
             char dst_ip[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &pend[i].dst.sin_addr, dst_ip, sizeof(dst_ip));
-            printf("\n[PUDP] Retrying message to %s (attempt %d/%d)\n> ", 
-                   dst_ip, pend[i].retries + 1, max_retries);
+            printf("\n[PUDP] Retrying message to %s (attempt %d/%d, timeout=%ums)\n> ", 
+                   dst_ip, pend[i].retries + 1, max_retries, pend[i].to_ms);
             fflush(stdout);
         }
         pthread_mutex_unlock(&pend_mtx);
-        struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 };
+        
+        // Reduz o intervalo de verificação para 50ms
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 50000000 };
         nanosleep(&ts, NULL);
     }
     return NULL;
