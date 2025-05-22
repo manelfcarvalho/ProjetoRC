@@ -10,7 +10,6 @@
 #define PUDP_CFG_MC_ADDR "239.0.0.100"
 #define PUDP_BASE_TO_MS   500
 #define PUDP_MAX_RETRY    5
-#define PUDP_MAX_PEERS    256
 
 /* flags */
 #define PUDP_F_ACK  0x1
@@ -44,7 +43,6 @@ typedef struct {
 /* register message */
 typedef struct {
     char psk[32];
-    char client_id[32];   /* Identificador único do cliente */
 } RegisterMessage;
 
 /* API */
@@ -52,15 +50,12 @@ int init_protocol_client(void);
 int init_protocol_server(void);
 void close_protocol(void);
 
-int send_message(const char *dest_id, const void *buf, int len);
+int send_message(const char *dest_ip, const void *buf, int len);
 int receive_message(void *buf, int buflen);
 int inject_packet_loss(int pct);
 
 /* extras for CLI synchronization */
 int powerudp_pending_count(void);
 int powerudp_last_event(uint32_t *seq, int *status);
-
-/* peer registration */
-void register_peer(const char *client_id, const char *ip);
 
 #endif /* POWERUDP_H */

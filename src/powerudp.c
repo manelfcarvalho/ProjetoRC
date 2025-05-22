@@ -21,61 +21,6 @@
 #define MAX_PEERS 256
 
 typedef struct {
-    char client_id[32];
-    char ip[INET_ADDRSTRLEN];
-    time_t last_seen;
-    int in_use;
-} PeerInfo;
-
-static PeerInfo peers[PUDP_MAX_PEERS];
-static pthread_mutex_t peers_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-/* Registra ou atualiza informações de um peer */
-void register_peer(const char *client_id, const char *ip) {
-    pthread_mutex_lock(&peers_mutex);
-    
-    // Procura se o peer já existe
-    for (int i = 0; i < PUDP_MAX_PEERS; i++) {
-        if (peers[i].in_use && strcmp(peers[i].client_id, client_id) == 0) {
-            // Atualiza IP e timestamp
-            strncpy(peers[i].ip, ip, INET_ADDRSTRLEN-1);
-            peers[i].last_seen = time(NULL);
-            pthread_mutex_unlock(&peers_mutex);
-            return;
-        }
-    }
-    
-    // Se não existe, procura slot livre
-    for (int i = 0; i < PUDP_MAX_PEERS; i++) {
-        if (!peers[i].in_use) {
-            strncpy(peers[i].client_id, client_id, sizeof(peers[i].client_id)-1);
-            strncpy(peers[i].ip, ip, INET_ADDRSTRLEN-1);
-            peers[i].last_seen = time(NULL);
-            peers[i].in_use = 1;
-            printf("[PUDP] Registered peer %s at %s\n", client_id, ip);
-            pthread_mutex_unlock(&peers_mutex);
-            return;
-        }
-    }
-    
-    pthread_mutex_unlock(&peers_mutex);
-}
-
-/* Procura o IP real de um peer pelo seu ID */
-static const char *find_peer_ip(const char *client_id) {
-    pthread_mutex_lock(&peers_mutex);
-    for (int i = 0; i < PUDP_MAX_PEERS; i++) {
-        if (peers[i].in_use && strcmp(peers[i].client_id, client_id) == 0) {
-            const char *ip = strdup(peers[i].ip);  // Aloca cópia para retornar
-            pthread_mutex_unlock(&peers_mutex);
-            return ip;
-        }
-    }
-    pthread_mutex_unlock(&peers_mutex);
-    return NULL;
-}
-
-typedef struct {
     uint32_t            seq;
     int                 len;
     char                data[sizeof(PUDPHeader) + MAX_PAYLOAD];
@@ -108,7 +53,8 @@ static uint32_t        last_evt_seq     = 0;
 /* Mapa de última sequência vista por IP */
 typedef struct {
     struct in_addr addr;
-    uint32_t      last_seen_seq;  // Última sequência vista deste peer
+    uint32_t      last_seen_seq;    // Última sequência recebida deste peer
+    uint32_t      last_sent_seq;    // Última sequência enviada para este peer
     int           in_use;
 } PeerState;
 
@@ -127,9 +73,10 @@ static int common_udp_init(uint16_t port);
 static void *retrans_loop(void *arg);
 static void apply_config(const ConfigMessage *cfg);
 static int resend_now(uint32_t seq);
-static uint32_t get_next_seq(void);
 static void update_all_peers_seq(uint32_t seq);
 static void broadcast_sync(uint32_t seq);
+static uint32_t get_next_seq_for_peer(struct in_addr addr);
+static void update_peer_seq(struct in_addr addr, uint32_t seq);
 
 /* Implementações das funções */
 static uint32_t now_ms(void) {
@@ -172,13 +119,6 @@ static void send_sync_message(const struct sockaddr_in *dst, uint32_t last_seq, 
            (struct sockaddr*)dst, sizeof(*dst));
 }
 
-static uint32_t get_next_seq(void) {
-    pthread_mutex_lock(&seq_mtx);
-    uint32_t seq = global_seq++;
-    pthread_mutex_unlock(&seq_mtx);
-    return seq;
-}
-
 static uint32_t get_peer_seq(struct in_addr addr) {
     pthread_mutex_lock(&seq_mtx);
     for (int i = 0; i < MAX_PEERS; i++) {
@@ -194,7 +134,8 @@ static uint32_t get_peer_seq(struct in_addr addr) {
     for (int i = 0; i < MAX_PEERS; i++) {
         if (!peer_states[i].in_use) {
             peer_states[i].addr = addr;
-            peer_states[i].last_seen_seq = 0;  // Começa esperando seq 1
+            peer_states[i].last_seen_seq = 0;
+            peer_states[i].last_sent_seq = 0;
             peer_states[i].in_use = 1;
             pthread_mutex_unlock(&seq_mtx);
             return 1;
@@ -385,6 +326,48 @@ static void update_all_peers_seq(uint32_t seq) {
     broadcast_sync(seq);
 }
 
+static uint32_t get_next_seq_for_peer(struct in_addr addr) {
+    pthread_mutex_lock(&seq_mtx);
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (peer_states[i].in_use && 
+            peer_states[i].addr.s_addr == addr.s_addr) {
+            peer_states[i].last_sent_seq++;
+            uint32_t seq = peer_states[i].last_sent_seq;
+            pthread_mutex_unlock(&seq_mtx);
+            return seq;
+        }
+    }
+    
+    // Novo peer, procura slot livre
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (!peer_states[i].in_use) {
+            peer_states[i].addr = addr;
+            peer_states[i].last_seen_seq = 0;
+            peer_states[i].last_sent_seq = 1;
+            peer_states[i].in_use = 1;
+            pthread_mutex_unlock(&seq_mtx);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&seq_mtx);
+    return 1;
+}
+
+static void update_peer_seq(struct in_addr addr, uint32_t seq) {
+    pthread_mutex_lock(&seq_mtx);
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (peer_states[i].in_use && 
+            peer_states[i].addr.s_addr == addr.s_addr) {
+            if (seq > peer_states[i].last_seen_seq) {
+                peer_states[i].last_seen_seq = seq;
+            }
+            pthread_mutex_unlock(&seq_mtx);
+            return;
+        }
+    }
+    pthread_mutex_unlock(&seq_mtx);
+}
+
 int receive_message(void *buf, int buflen) {
     char frame[sizeof(PUDPHeader) + MAX_PAYLOAD];
     struct sockaddr_in src;
@@ -441,7 +424,7 @@ int receive_message(void *buf, int buflen) {
     }
 
     if (h->seq == peer_expected_seq) {
-        update_all_peers_seq(h->seq);
+        update_peer_seq(src.sin_addr, h->seq);
         send_ack(&src, h->seq);
 
         int dlen = n - (int)sizeof(*h);
@@ -459,34 +442,21 @@ int receive_message(void *buf, int buflen) {
     }
 }
 
-int send_message(const char *dest_id, const void *buf, int len) {
+int send_message(const char *dest_ip, const void *buf, int len) {
     if (len > MAX_PAYLOAD) { errno = EINVAL; return -1; }
     
-    // Primeiro tenta interpretar como IP (para compatibilidade)
     struct sockaddr_in dst = {
         .sin_family = AF_INET,
         .sin_port   = htons(PUDP_DATA_PORT)
     };
-    
-    if (inet_pton(AF_INET, dest_id, &dst.sin_addr) != 1) {
-        // Se não é IP, procura o peer pelo ID
-        const char *real_ip = find_peer_ip(dest_id);
-        if (!real_ip) {
-            printf("\n[PUDP] Unknown peer ID: %s\n> ", dest_id);
-            errno = EINVAL;
-            return -1;
-        }
-        if (inet_pton(AF_INET, real_ip, &dst.sin_addr) != 1) {
-            free((void*)real_ip);
-            errno = EINVAL;
-            return -1;
-        }
-        free((void*)real_ip);
+    if (inet_pton(AF_INET, dest_ip, &dst.sin_addr) != 1) {
+        errno = EINVAL;
+        return -1;
     }
 
     char frame[sizeof(PUDPHeader) + MAX_PAYLOAD];
     PUDPHeader *h = (PUDPHeader*)frame;
-    h->seq   = htonl(get_next_seq());
+    h->seq   = htonl(get_next_seq_for_peer(dst.sin_addr));  // Usa sequência específica por peer
     h->flags = 0;
     memcpy(frame + sizeof(*h), buf, len);
     int flen = sizeof(*h) + len;
