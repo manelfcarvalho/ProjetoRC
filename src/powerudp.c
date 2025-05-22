@@ -265,6 +265,14 @@ static void *retrans_loop(void *arg) {
                 send_sync_message(&pend[i].dst, pend[i].seq, global_seq);
                 last_evt_status = -1;
                 last_evt_seq = pend[i].seq;
+                
+                // Adiciona log quando uma mensagem é descartada
+                char dst_ip[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &pend[i].dst.sin_addr, dst_ip, sizeof(dst_ip));
+                printf("\n[PUDP] Message to %s dropped after %d retries\n> ", 
+                       dst_ip, max_retries);
+                fflush(stdout);
+                
                 pend[i].in_use = 0;
                 continue;
             }
@@ -274,6 +282,13 @@ static void *retrans_loop(void *arg) {
             gettimeofday(&pend[i].ts, NULL);
             pend[i].retries++;
             pend[i].to_ms *= 2;
+
+            // Adiciona log de retransmissão
+            char dst_ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &pend[i].dst.sin_addr, dst_ip, sizeof(dst_ip));
+            printf("\n[PUDP] Retrying message to %s (attempt %d/%d)\n> ", 
+                   dst_ip, pend[i].retries + 1, max_retries);
+            fflush(stdout);
         }
         pthread_mutex_unlock(&pend_mtx);
         struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 };

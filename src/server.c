@@ -28,34 +28,24 @@ static void multicast_config(uint16_t to_ms, uint8_t max_rtx)
         return;
     }
 
-    // Envia a mensagem 3 vezes para aumentar a chance de recepção
-    for (int i = 0; i < 3; i++) {
-        char frame[sizeof(PUDPHeader) + sizeof(ConfigMessage)];
-        PUDPHeader *h = (PUDPHeader *)frame;
-        h->seq   = htonl(0);
-        h->flags = PUDP_F_CFG;
+    // Prepara e envia a mensagem de configuração
+    char frame[sizeof(PUDPHeader) + sizeof(ConfigMessage)];
+    PUDPHeader *h = (PUDPHeader *)frame;
+    h->seq   = htonl(0);
+    h->flags = PUDP_F_CFG;
 
-        ConfigMessage *c = (ConfigMessage *)(frame + sizeof(PUDPHeader));
-        c->base_timeout_ms = (uint32_t)to_ms;
-        c->max_retries     = max_rtx;
+    ConfigMessage *c = (ConfigMessage *)(frame + sizeof(PUDPHeader));
+    c->base_timeout_ms = (uint32_t)to_ms;
+    c->max_retries     = max_rtx;
 
-        // Envia para o endereço multicast
-        if (sendto(mc_sock, frame, sizeof frame, 0,
-                   (struct sockaddr *)&mc_dst, sizeof mc_dst) < 0) {
-            perror("sendto multicast");
-            continue;
-        }
-
-        printf("[SRV] Sent config (try %d/3): timeout=%u ms, retries=%u\n",
-               i+1, to_ms, max_rtx);
-
-        // Pequeno delay entre retransmissões
-        struct timespec ts = {
-            .tv_sec = 0,
-            .tv_nsec = 100000000  // 100ms
-        };
-        nanosleep(&ts, NULL);
+    // Envia para o endereço multicast
+    if (sendto(mc_sock, frame, sizeof frame, 0,
+               (struct sockaddr *)&mc_dst, sizeof mc_dst) < 0) {
+        perror("sendto multicast");
+        return;
     }
+
+    printf("[SRV] Sent config: timeout=%u ms, retries=%u\n", to_ms, max_rtx);
 }
 
 /* Thread por cliente TCP */
