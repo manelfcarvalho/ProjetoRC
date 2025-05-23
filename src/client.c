@@ -114,7 +114,7 @@ int main(int argc, char **argv) {
     }
 
     /* opcional: simular perda de 30% nos pacotes enviados */
-    // inject_packet_loss(30);
+    inject_packet_loss(30);
 
     /* 2) join multicast group for dynamic config */
     join_cfg_multicast();
